@@ -9,7 +9,7 @@ import regex as re
 
 from flashdate.timezone_parser import _prefix_tree_pattern, is_timezone_token
 from flashdate.utils import normalize_unicode
-from flashdate.utils.letters import is_letter_free, requires_letter
+from flashdate.utils.letters import case_variants, is_letter_free, requires_letter
 
 if TYPE_CHECKING:
     from flashdate.conf import Settings
@@ -18,26 +18,6 @@ _T = TypeVar("_T")
 _CacheKey = tuple[Any, ...]
 
 _SPLIT_FLAGS = re.UNICODE | re.IGNORECASE | re.DOTALL
-
-
-def _case_variants(character: str) -> set[str]:
-    """Return the characters that *character* may match ignoring case, erring
-    on the side of too many."""
-    variants = {character}
-    pending = [character]
-    while pending:
-        current = pending.pop()
-        for changed in (
-            current.upper(),
-            current.lower(),
-            current.casefold(),
-            current.title(),
-        ):
-            for variant in changed:
-                if variant not in variants:
-                    variants.add(variant)
-                    pending.append(variant)
-    return variants
 
 
 def _known_words_pattern(words: list[str]) -> str:
@@ -62,7 +42,7 @@ def _known_words_pattern(words: list[str]) -> str:
         node = pending.pop()
         seen: set[str] = set()
         for character, child in node.items():
-            variants = _case_variants(character)
+            variants = case_variants(character)
             if not seen.isdisjoint(variants) or any(
                 re.fullmatch(re.escape(character), other, _SPLIT_FLAGS)
                 or re.fullmatch(re.escape(other), character, _SPLIT_FLAGS)

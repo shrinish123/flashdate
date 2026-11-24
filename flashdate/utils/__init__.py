@@ -46,6 +46,9 @@ def strip_braces(date_string: str) -> str:
 def normalize_unicode(
     string: str, form: Literal["NFC", "NFD", "NFKC", "NFKD"] = "NFKD"
 ) -> str:
+    if string.isascii():
+        # Already normalized in every form, and without marks.
+        return string
     return "".join(
         c
         for c in unicodedata.normalize(form, string)

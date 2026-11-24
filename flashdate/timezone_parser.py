@@ -192,11 +192,12 @@ class _TzRegexes(NamedTuple):
     """Matches any timezone name."""
     names_ignorecase: re.Pattern[str]
     """Matches any timezone name, case-insensitively."""
-    literal: list[tuple[regex.Pattern[str], dict[str, int]] | None] = []
-    """For each family whose timezone names are plain words, a pattern that
+    literal: list[tuple[regex.Pattern[str], dict[str, int], bool] | None] = []
+    """For each family whose timezone names are plain words: a pattern that
     matches the same strings as the family pattern but faster, because it has
-    no groups and shares the common prefixes of the names, and the index of
-    the first timezone with each lowercase name. ``None`` for other families."""
+    no groups and shares the common prefixes of the names; the index of the
+    first timezone with each lowercase name; and whether the matches of both
+    patterns are the same. ``None`` for other families."""
 
 
 _tz_regexes_lock = threading.Lock()
@@ -206,6 +207,12 @@ def _tz_regexes() -> _TzRegexes:
     """Return the timezone regexes, compiled on first use."""
     with _tz_regexes_lock:
         return _build_tz_regexes()
+
+
+# Timezone names made of letters can only match this template in one way at
+# a given position, since no name can end where a longer one continues with
+# a letter. Therefore, their prefix tree finds the same matches.
+_WORD_TEMPLATE = r"(\W|\d|_)%s($|\W|(?=\d))"
 
 
 def _prefix_tree_pattern(words: "Iterable[str]") -> str:
@@ -237,7 +244,7 @@ def _prefix_tree_pattern(words: "Iterable[str]") -> str:
 @cache
 def _build_tz_regexes() -> _TzRegexes:
     families: list[tuple[regex.Pattern[str], list[tuple[str, timedelta]]]] = []
-    literal: list[tuple[regex.Pattern[str], dict[str, int]] | None] = []
+    literal: list[tuple[regex.Pattern[str], dict[str, int], bool] | None] = []
     names: list[str] = []
     for tz_info in timezone_info_list:
         for template in tz_info["regex_patterns"]:
@@ -281,6 +288,7 @@ def _build_tz_regexes() -> _TzRegexes:
                             cache_pattern=False,
                         ),
                         first_index,
+                        template == _WORD_TEMPLATE,
                     )
                 )
             else:
@@ -293,6 +301,29 @@ def _build_tz_regexes() -> _TzRegexes:
         re.compile(names_pattern, re.IGNORECASE),
         literal,
     )
+
+
+def _matched_timezone(match: regex.Match[str], count: int) -> int:
+    """Return the index of the timezone, out of *count*, that *match* found.
+
+    Asking the match for its named groups builds hundreds of them, so look
+    for the span of the group of the timezone instead: it starts where the
+    first group ends, and ends where the group after the timezones starts, or
+    where the match ends if there is no such group.
+    """
+    spans = match.regs
+    end = None
+    if len(spans) == count + 3:
+        end = spans[-1][0]
+    elif len(spans) == count + 2:
+        end = spans[0][1]
+    if end is not None:
+        try:
+            return spans.index((spans[1][1], end), 2) - 2
+        except ValueError:
+            pass
+    group = next(k for k, v in match.groupdict().items() if v is not None)
+    return int(group[2:])
 
 
 # A date string is searched several times while it is parsed, once per parser
@@ -311,34 +342,37 @@ def _find_tz(
     for (pattern, timezones), literal in zip(
         tz_regexes.families, tz_regexes.literal, strict=True
     ):
-        first_index: dict[str, int] = {}
+        best: tuple[int, tuple[int, int]] | None = None
         if literal is not None:
-            if not literal[0].search(string):
+            literal_pattern, first_index, same_matches = literal
+            if same_matches:
+                # overlapped: in "EST/EDT" both matches share the "/"
+                for match in literal_pattern.finditer(string, overlapped=True):
+                    found = first_index.get(
+                        string[match.end(1) : match.start(2)].lower()
+                    )
+                    if found is None:
+                        # A letter written in a way that lowercasing does not
+                        # undo, e.g. "ſ" for "s".
+                        best = None
+                        break
+                    if best is None or found < best[0]:
+                        best = (found, match.span())
+                else:
+                    if best:
+                        name, offset = timezones[best[0]]
+                        return best[1], name, offset
+                    continue
+            elif not literal_pattern.search(string):
                 continue
-            first_index = literal[1]
         matches: Iterable[regex.Match[str]]
         if pattern.flags & regex.REVERSE:
             match = pattern.search(string)
             matches = [match] if match else []
         else:
-            # overlapped: in "EST/EDT" both matches share the "/"
             matches = pattern.finditer(string, overlapped=True)
-        best: tuple[int, tuple[int, int]] | None = None
-        # The same timezone text always matches the same group, and finding
-        # that group means checking hundreds of them, so do it once per text.
-        # Group 1 and the last group match the characters around the text.
-        indexes: dict[str, int] = {}
         for match in matches:
-            text = string[match.end(1) : match.start(pattern.groups)].lower()
-            if text in first_index:
-                index = first_index[text]
-            else:
-                if text not in indexes:
-                    group = next(
-                        k for k, v in match.groupdict().items() if v is not None
-                    )
-                    indexes[text] = int(group[2:])
-                index = indexes[text]
+            index = _matched_timezone(match, len(timezones))
             if best is None or index < best[0]:
                 best = (index, match.span())
         if best:

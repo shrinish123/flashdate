@@ -14,7 +14,13 @@ from flashdate.timezone_parser import (
     word_is_tz,
 )
 from flashdate.utils import combine_dicts, normalize_unicode
-from flashdate.utils.letters import is_letter_free, requires_letter
+from flashdate.utils.letters import (
+    case_variants,
+    is_letter_free,
+    letters,
+    matched_letters,
+    requires_letter,
+)
 
 from .dictionary import (
     ALWAYS_KEEP_TOKENS,
@@ -172,6 +178,12 @@ class Locale:
         # What is known about the letters that the patterns of this locale
         # require, by the identity of the collection of patterns.
         self._letter_requirements: dict[int, tuple[Any, Any]] = {}
+        # The last dictionary bound to settings: the dictionary, the settings,
+        # their skip tokens, which the caches of a dictionary depend on, and
+        # the bound dictionary.
+        self._bound_dictionary: tuple[Dictionary, Any, list[str], Dictionary] | None
+        self._bound_dictionary = None
+        self._alphabets: dict[tuple[Any, ...], frozenset[str] | None] = {}
 
     @cached_property
     def _native(self) -> "Locale":
@@ -216,7 +228,15 @@ class Locale:
 
         assert settings is not None
         dictionary = self._get_dictionary(settings)
-        date_tokens = self._split_simplified(date_string, settings, dictionary)
+        date_tokens = self._split_simplified(
+            date_string,
+            settings,
+            dictionary,
+            # Unless such a letter may be in a token that gets ignored.
+            unless_foreign=not ignore_surrounding_text,
+        )
+        if date_tokens is None:
+            return False
         if ignore_surrounding_text:
             date_tokens = dictionary._strip_unknown_edge_tokens(date_tokens)
         return dictionary.are_tokens_valid(date_tokens)
@@ -330,6 +350,7 @@ class Locale:
         date_string_tokens = self._split_simplified(
             date_string, settings, dictionary, keep_formatting
         )
+        assert date_string_tokens is not None
         if ignore_surrounding_text:
             date_string_tokens = dictionary._strip_unknown_edge_tokens(
                 date_string_tokens
@@ -431,8 +452,12 @@ class Locale:
         settings: "Settings",
         dictionary: "Dictionary",
         keep_formatting: bool = False,
-    ) -> list[str]:
-        """Return the tokens of *date_string* after simplifying it."""
+        unless_foreign: bool = False,
+    ) -> list[str] | None:
+        """Return the tokens of *date_string* after simplifying it, or
+        ``None`` if *unless_foreign* is true and the tokens are sure not to be
+        valid, because *date_string* has a letter that is foreign to this
+        locale."""
         last = self._last_split
         if (
             last is not None
@@ -441,13 +466,77 @@ class Locale:
             and last[2] is keep_formatting
         ):
             return list(last[3])
-        simplified = self._translate_numerals(date_string)
+        prepared = self._translate_numerals(date_string)
         if settings.NORMALIZE:
-            simplified = normalize_unicode(simplified)
-        simplified = self._simplify(simplified, settings=settings)
+            prepared = normalize_unicode(prepared)
+        prepared = self._prepare_to_simplify(prepared)
+        if unless_foreign and self._has_foreign_letter(prepared, settings, dictionary):
+            return None
+        simplified = self._simplify_prepared(prepared, settings)
         tokens = dictionary.split(simplified, keep_formatting)
         self._last_split = (settings, date_string, keep_formatting, tokens.copy())
         return tokens
+
+    def _has_foreign_letter(
+        self, prepared: str, settings: "Settings", dictionary: "Dictionary"
+    ) -> bool:
+        """Return whether *prepared*, a date string prepared to be simplified,
+        has a letter that no word or pattern of this locale has, so that the
+        token with that letter cannot be valid."""
+        alphabet = self._get_alphabet(settings, dictionary)
+        if alphabet is None:
+            return False
+        foreign = letters(prepared) - alphabet
+        if not foreign or "\n" in prepared or prepared != prepared.lower():
+            # A token with a line break is not kept, and lowercasing happens
+            # again after each simplification.
+            return False
+        return any(case_variants(letter).isdisjoint(alphabet) for letter in foreign)
+
+    def _get_alphabet(
+        self, settings: "Settings", dictionary: "Dictionary"
+    ) -> frozenset[str] | None:
+        """Return the letters, with their case variants, that tokens valid for
+        this locale can have, or ``None`` if they can have any letter."""
+        key = (bool(settings.NORMALIZE), *settings.SKIP_TOKENS)
+        try:
+            return self._alphabets[key]
+        except KeyError:
+            pass
+        except TypeError:  # unhashable skip tokens
+            return None
+        alphabet = self._generate_alphabet(settings, dictionary)
+        if len(self._alphabets) >= 8:
+            self._alphabets.clear()
+        self._alphabets[key] = alphabet
+        return alphabet
+
+    def _generate_alphabet(
+        self, settings: "Settings", dictionary: "Dictionary"
+    ) -> frozenset[str] | None:
+        # A valid token is a number, a word of the dictionary, or a match of a
+        # relative string. A letter of the date string ends up in a token
+        # unless a simplification matches it, or it is in an ordinal suffix,
+        # which is dropped after a number.
+        words = list(dictionary)
+        if not all(isinstance(word, str) and word for word in words):
+            return None
+        spelled = set("stndrh").union(*words)
+        patterns = [
+            dictionary._get_split_relative_regex_cache(),
+            dictionary._get_match_relative_regex_cache(),
+        ]
+        for simplification in self._get_simplifications(settings=settings):
+            for pattern, replacement in simplification.items():
+                if "\n" in replacement:
+                    return None
+                patterns.append(pattern)
+        for pattern in patterns:
+            matched = matched_letters(pattern.pattern)
+            if matched is None or pattern.flags & re.VERBOSE:
+                return None
+            spelled |= matched
+        return frozenset().union(*map(case_variants, spelled))
 
     def _translate_numerals(self, date_string: str) -> str:
         date_string_tokens = NUMERAL_PATTERN.split(date_string)
@@ -984,9 +1073,17 @@ class Locale:
         return re.search(r"\d+", token) is not None
 
     def _simplify(self, date_string: str, settings: "Settings | None" = None) -> str:
+        return self._simplify_prepared(self._prepare_to_simplify(date_string), settings)
+
+    def _prepare_to_simplify(self, date_string: str) -> str:
         date_string = date_string.lower()
         if self._translates_letters:
             date_string = _translate_letters(date_string)
+        return date_string
+
+    def _simplify_prepared(
+        self, date_string: str, settings: "Settings | None" = None
+    ) -> str:
         simplifications = self._get_simplifications(settings=settings)
 
         if self.info.get("name") == "ru":
@@ -1176,9 +1273,28 @@ class Locale:
 
     def _get_dictionary(self, settings: "Settings | None" = None) -> Dictionary:
         assert settings is not None
+        dictionary: Dictionary
         if not settings.NORMALIZE:
-            return self._bind_settings(self._get_base_dictionary(), settings)
-        return self._bind_settings(self._get_normalized_dictionary(settings), settings)
+            dictionary = self._get_base_dictionary()
+        else:
+            dictionary = self._get_normalized_dictionary(settings)
+        # The same settings ask for the same dictionary for every date string.
+        bound = self._bound_dictionary
+        if (
+            bound is not None
+            and bound[0] is dictionary
+            and bound[1] is settings
+            and bound[2] == settings.SKIP_TOKENS
+        ):
+            return bound[3]
+        result = self._bind_settings(dictionary, settings)
+        self._bound_dictionary = (
+            dictionary,
+            settings,
+            list(settings.SKIP_TOKENS),
+            result,
+        )
+        return result
 
     def _get_base_dictionary(self) -> Dictionary:
         with self._lock:
