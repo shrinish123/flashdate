@@ -551,17 +551,56 @@ def _translate_names(
         )
 
 
-# Dates and date times made of numbers alone that need not go through language
-# detection, translation and the parsers, because with the configuration that
+# Dates and date times that need not go through language detection,
+# translation and the parsers, because with the configuration that
 # DateDataParser._reads_directly allows the outcome is known from their
-# digits: ISO 8601 ones, which every locale reads the same way, and those with
-# the year last, which are read with the month first, as in English, unless
-# only the day can go first.
-_DIRECT = stdlib_re.compile(
+# digits and English month names: ISO 8601 ones, which every locale reads the
+# same way; those made of numbers with the year last, which are read with the
+# month first, as in English, unless only the day can go first or DATE_ORDER
+# says that the day goes first; and those with the name of the month.
+_TIME_ZONE = r"[+-][0-9]{2}:?[0-9]{2}"
+_NUMERIC = stdlib_re.compile(
     r"(?:([0-9]{4})-([0-9]{2})-([0-9]{2})"
     r"|([0-9]{1,2})([/.])([0-9]{1,2})\5([0-9]{4}))"
     r"(?:[T ]([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.([0-9]{1,6}))?)?"
-    r"(Z|[+-][0-9]{2}:?[0-9]{2})?)?"
+    rf"(Z|{_TIME_ZONE})?)?"
+)
+_MONTH_NUMBERS = {
+    name: number
+    for number, names in enumerate(
+        (
+            ("jan", "january"),
+            ("feb", "february"),
+            ("mar", "march"),
+            ("apr", "april"),
+            ("may",),
+            ("jun", "june"),
+            ("jul", "july"),
+            ("aug", "august"),
+            ("sep", "sept", "september"),
+            ("oct", "october"),
+            ("nov", "november"),
+            ("dec", "december"),
+        ),
+        start=1,
+    )
+    for name in names
+}
+_MONTH = "|".join(sorted(_MONTH_NUMBERS, key=len, reverse=True))
+_WEEKDAY = (
+    "monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+    "|mon|tues|tue|wed|thu|fri|sat|sun"
+)
+_ORDINAL = "(?:st|nd|rd|th)?"
+# E.g. "March 5, 2023", "Tue, 02 Jan 2024 13:45:00 GMT" or "5 Mar 2023 1:30 PM".
+# Not "5-Mar-2023": a year after a hyphen may be read as a UTC offset.
+_TEXT = stdlib_re.compile(
+    rf"(?:(?:{_WEEKDAY}),? )?"
+    rf"(?:({_MONTH})\.? ([0-9]{{1,2}}){_ORDINAL}(?:, ?| )([1-9][0-9]{{3}})"
+    rf"|([0-9]{{1,2}}){_ORDINAL} ({_MONTH})\.? ([1-9][0-9]{{3}}))"
+    r"(?:(?:,? | at )([0-9]{1,2}):([0-9]{2})(?::([0-9]{2}))?(?: ?([ap]m))?"
+    rf"(?: (GMT|UTC|{_TIME_ZONE}))?)?",
+    stdlib_re.IGNORECASE | stdlib_re.ASCII,
 )
 _SHORTCUT = True
 _DEFAULT_SETTINGS_VALUES = copy.deepcopy(vars(_default_settings))
@@ -579,25 +618,28 @@ _SHORTCUT_SETTINGS = frozenset(
         "REQUIRE_PARTS",
     }
 )
+# The date orders that may be set, with the pairs of number positions to try
+# as the month and the day.
+_SHORTCUT_DATE_ORDERS = {"MDY": ((0, 1), (1, 0)), "DMY": ((1, 0), (0, 1))}
 _SETTINGS_ATTRIBUTES = frozenset(
     {*_DEFAULT_SETTINGS_VALUES, "_default", "_mod_settings"}
 )
-# The name and offset of the time zone that each UTC offset was read as when
-# a date string with it went through the parsers.
+# The name and offset of the time zone that each time zone at the end of a
+# date string, with the space before it if any, was read as when a date
+# string with it went through the parsers.
 _SHORTCUT_OFFSETS: dict[str, tuple[str, timedelta]] = {}
 _MAX_SHORTCUT_OFFSETS = 512
 _DATE_PARTS = ("year", "month", "day")
 _DATE_TIME_PARTS = ("year", "month", "day", "time")
+_Time = tuple[int, int, int, int]
+_NO_TIME: _Time = (0, 0, 0, 0)
 
 
-def _read_directly(
-    match: "stdlib_re.Match[str]",
-    tz: tuple[str, timedelta] | None,
-    settings: Settings,
-) -> "DateData | None":
-    """Return the date data of a date string that :data:`_DIRECT` matches,
-    given its time zone if it has a UTC offset, or ``None`` if it is not a
-    valid date, in which case it has to go through the parsers."""
+def _numeric_parts(
+    match: "stdlib_re.Match[str]", settings: Settings
+) -> tuple[int, tuple[tuple[int, int], ...], _Time | None]:
+    """Return the year, the months and days to try, and the time, if any, of
+    a date string that :data:`_NUMERIC` matches."""
     (
         iso_year,
         iso_month,
@@ -612,25 +654,87 @@ def _read_directly(
         fraction,
         _,
     ) = match.groups()
+    time = None
+    if hour is not None:
+        time = (
+            int(hour),
+            int(minute),
+            int(second) if second else 0,
+            int(fraction.ljust(6, "0")) if fraction else 0,
+        )
+    if iso_year is not None:
+        return int(iso_year), ((int(iso_month), int(iso_day)),), time
+    numbers = (int(first), int(second_number))
+    order = "MDY"
+    if "DATE_ORDER" in settings._mod_settings:
+        order = settings.DATE_ORDER
+    return (
+        int(year),
+        tuple(
+            (numbers[month], numbers[day])
+            for month, day in _SHORTCUT_DATE_ORDERS[order]
+        ),
+        time,
+    )
+
+
+def _text_parts(
+    match: "stdlib_re.Match[str]",
+) -> tuple[int, tuple[tuple[int, int], ...], _Time | None]:
+    """Return the year, the month and day, and the time, if any, of a date
+    string that :data:`_TEXT` matches."""
+    (
+        month,
+        day,
+        year,
+        day_first,
+        month_second,
+        year_last,
+        hour,
+        minute,
+        second,
+        meridian,
+        _,
+    ) = match.groups()
+    if month is None:
+        month, day, year = month_second, day_first, year_last
+    time = None
+    if hour is not None:
+        hours = int(hour)
+        if meridian:
+            if not 1 <= hours <= 12:
+                raise ValueError(hour)
+            hours = hours % 12 + (12 if meridian.lower() == "pm" else 0)
+        time = (hours, int(minute), int(second) if second else 0, 0)
+    return int(year), ((_MONTH_NUMBERS[month.lower()], int(day)),), time
+
+
+def _read_directly(
+    match: "stdlib_re.Match[str]",
+    tz: tuple[str, timedelta] | None,
+    settings: Settings,
+) -> "DateData | None":
+    """Return the date data of a date string that :data:`_NUMERIC` or
+    :data:`_TEXT` matches, given its time zone, if it has one, or ``None`` if
+    it is not a valid date, in which case it has to go through the parsers."""
     try:
         if datetime.today().year < 1000:
             # The parsers read a day of the month along with the current
             # year, which they cannot do if it has less than four digits.
             return None
-        hours = minutes = seconds = microseconds = 0
-        if hour is not None:
-            hours = int(hour)
-            minutes = int(minute)
-            seconds = int(second) if second else 0
-            microseconds = int(fraction.ljust(6, "0")) if fraction else 0
-        time = (hours, minutes, seconds, microseconds)
-        if iso_year is not None:
-            date_obj = datetime(int(iso_year), int(iso_month), int(iso_day), *time)
+        if match.re is _NUMERIC:
+            year, months_and_days, time = _numeric_parts(match, settings)
         else:
+            year, months_and_days, time = _text_parts(match)
+        date_obj = None
+        for month, day in months_and_days:
             try:
-                date_obj = datetime(int(year), int(first), int(second_number), *time)
+                date_obj = datetime(year, month, day, *(time or _NO_TIME))
             except ValueError:
-                date_obj = datetime(int(year), int(second_number), int(first), *time)
+                continue
+            break
+        if date_obj is None:
+            return None
         date_obj = _apply_timezone_settings(
             date_obj, StaticTzInfo(*tz) if tz else None, settings
         )
@@ -642,7 +746,7 @@ def _read_directly(
         date_obj=date_obj,
         period="day",
         locale="en",
-        parts=_DATE_PARTS if hour is None else _DATE_TIME_PARTS,
+        parts=_DATE_PARTS if time is None else _DATE_TIME_PARTS,
     )
 
 
@@ -1064,7 +1168,7 @@ class DateDataParser:
 
     def _reads_directly(self) -> bool:
         """Return whether the configuration is one with which the outcome for
-        the date strings that :data:`_DIRECT` matches is known."""
+        the date strings that :data:`_NUMERIC` and :data:`_TEXT` match is known."""
         if not (
             type(self) is DateDataParser
             and (not self.languages or self.languages == ["en"])
@@ -1079,14 +1183,22 @@ class DateDataParser:
         known = self._shortcut_settings
         if known is not None and known[0] == values:
             return known[1]
+        modified = set(self._settings._mod_settings)
+        # A date order that is set replaces that of the locale.
+        date_order_set = "DATE_ORDER" in modified
+        modified.discard("DATE_ORDER")
         allowed = (
             values.keys() <= _SETTINGS_ATTRIBUTES
             and all(
                 values.get(name, value) == value
                 for name, value in _DEFAULT_SETTINGS_VALUES.items()
                 if name not in _SHORTCUT_SETTINGS
+                and not (name == "DATE_ORDER" and date_order_set)
             )
-            and _SHORTCUT_SETTINGS.issuperset(self._settings._mod_settings)
+            and (
+                not date_order_set or values.get("DATE_ORDER") in _SHORTCUT_DATE_ORDERS
+            )
+            and _SHORTCUT_SETTINGS.issuperset(modified)
         )
         # The values that can change in place are lists and mappings of
         # values that cannot.
@@ -1163,14 +1275,16 @@ class DateDataParser:
 
         match = None
         if _SHORTCUT and not date_formats:
-            match = _DIRECT.fullmatch(date_string)
+            match = _NUMERIC.fullmatch(date_string) or _TEXT.fullmatch(date_string)
         if match is None or not self._reads_directly():
             return self._get_date_data(date_string, date_formats)
-        suffix = match[12]
+        suffix = match.group(match.re.groups)
         tz: tuple[str, timedelta] | None = None
         if suffix == "Z":
             tz = ("Z", timedelta(0))
         elif suffix is not None:
+            if match.re is _TEXT:
+                suffix = f" {suffix}"
             tz = _SHORTCUT_OFFSETS.get(suffix)
         if suffix is None or tz is not None:
             date_data = _read_directly(match, tz, self._settings)
@@ -1178,8 +1292,8 @@ class DateDataParser:
                 return date_data
         date_data = self._get_date_data(date_string, date_formats)
         if suffix is not None and tz is None:
-            # Remember the time zone that the offset is read as, if reading
-            # the rest of the date string as above gives the same outcome.
+            # Remember the time zone that the end of the date string is read
+            # as, if reading the rest of it as above gives the same outcome.
             _, tzinfo = pop_tz_offset_from_string(date_string, settings=self._settings)
             if tzinfo is not None:
                 tz = tzinfo.__getinitargs__()

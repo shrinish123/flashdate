@@ -1,5 +1,6 @@
-"""Dates made of numbers alone are read without going through language
-detection, translation and the parsers, which must give the same outcome."""
+"""Dates made of numbers, and of numbers and English month names, are read
+without going through language detection, translation and the parsers, which
+must give the same outcome."""
 
 import calendar
 import random
@@ -48,10 +49,15 @@ def _strings() -> list[str]:
         separator = random_.choice("/.")
         offset = random_.choice(["Z", "+00:00", "+05:30", "-0800", "+0100", "+07:30"])
         time = f"{random_.choice('T ')}{hour:02d}:{minute:02d}"
+        name = calendar.month_name[month]
+        weekday = calendar.day_abbr[random_.randrange(7)]
         for date_ in (
             f"{year:04d}-{month:02d}-{day:02d}",
             f"{month:02d}{separator}{day:02d}{separator}{year:04d}",
             f"{day}{separator}{month}{separator}{year:04d}",
+            f"{name} {day}, {max(year, 1000)}",
+            f"{weekday}, {day:02d} {name[:3]} {max(year, 1000)}",
+            f"{day}th-{name[:3].upper()}.-{max(year, 1000)}",
         ):
             strings += [
                 date_,
@@ -61,6 +67,9 @@ def _strings() -> list[str]:
                 f"{date_}{time}:{second:02d}{offset}",
                 f"{date_}{time}:{second:02d}.{fraction}{offset}",
                 date_ + time + offset,
+                f"{date_} at {hour % 12 or 12}:{minute:02d} {'AP'[hour // 12]}M",
+                f"{date_}, {hour:02d}:{minute:02d}:{second:02d} GMT",
+                f"{date_} {hour}:{minute:02d} {offset}",
             ]
     # Dates that do not exist, and shapes that are close to the ones above.
     strings += [
@@ -107,6 +116,34 @@ def _strings() -> list[str]:
         "2021-03-14 02:30:00",
         "2021-11-07 01:30:00",
         "03/28/2021 02:30:00",
+        "February 30, 2021",
+        "March 5, 999",
+        "March 5, 0999",
+        "March 5, 12021",
+        "March 52021",
+        "Marc 5, 2021",
+        "mars 5, 2021",
+        "5 mars 2021",
+        "Sept. 5, 2021",
+        "March 5, 2021 13:00 PM",
+        "March 5, 2021 0:30 AM",
+        "March 5, 2021 12:30 AM",
+        "March 5, 2021 12:30 PM",
+        "March 5, 2021 10:30 a.m.",
+        "March 5, 2021 25:00",
+        "March 5, 2021 10:30 EST",
+        "March 5, 2021 10:30 Z",
+        "March 5, 2021 10:30Z",
+        "Thurs, March 5, 2021",
+        "Fri March 5 2021",
+        "March 5 , 2021",
+        "March  5, 2021",
+        "5 March, 2021",
+        "5-March 2021",
+        "5-Mar-2021",
+        "26th-DEC.-1000",
+        "05/Mar/2021:10:30:00 +0000",
+        "Tue Jan  2 13:45:00 2024",
     ]
     return strings
 
@@ -135,6 +172,16 @@ CONFIGURATIONS: list[dict[str, Any]] = [
             "PREFER_MONTH_OF_YEAR": "first",
             "STRICT_PARSING": True,
             "REQUIRE_PARTS": ["day", "month", "year"],
+        },
+    },
+    {"settings": {"DATE_ORDER": "DMY"}},
+    {"settings": {"DATE_ORDER": "MDY"}},
+    {
+        "languages": ["en"],
+        "settings": {
+            "DATE_ORDER": "DMY",
+            "TIMEZONE": "UTC",
+            "RETURN_AS_TIMEZONE_AWARE": True,
         },
     },
     # Time zones that do not exist are reported the same way.
@@ -184,6 +231,21 @@ def test_shortcut_reads_dates(monkeypatch: pytest.MonkeyPatch) -> None:
     assert flashdate.parse("15/04/2022") == datetime(2022, 4, 15)
     assert flashdate.parse("5.6.2021 14:30") == datetime(2021, 5, 6, 14, 30)
     assert flashdate.parse("2023-11-05", languages=["en"]) == datetime(2023, 11, 5)
+    # With the name of the month.
+    assert flashdate.parse("March 5, 2023") == datetime(2023, 3, 5)
+    assert flashdate.parse("5th Sept. 2023 1:30 PM") == datetime(2023, 9, 5, 13, 30)
+    parsed = flashdate.parse("Tue, 02 Jan 2024 13:45:00 GMT")
+    assert parsed == flashdate.parse("Tue, 02 Jan 2024 13:45:00 GMT")
+    assert parsed is not None
+    assert parsed.replace(tzinfo=None) == datetime(2024, 1, 2, 13, 45)
+    assert parsed.utcoffset() == timedelta(0)
+    # A date order that is set decides which number goes first.
+    assert flashdate.parse("05/06/2021", settings={"DATE_ORDER": "DMY"}) == datetime(
+        2021, 6, 5
+    )
+    assert flashdate.parse("05/13/2021", settings={"DATE_ORDER": "DMY"}) == datetime(
+        2021, 5, 13
+    )
     parsed = flashdate.parse(
         "2023-11-05 08:15",
         settings={"TIMEZONE": "UTC", "RETURN_AS_TIMEZONE_AWARE": True},
@@ -200,9 +262,8 @@ def test_shortcut_reads_dates(monkeypatch: pytest.MonkeyPatch) -> None:
         {"locales": ["en-AU"]},
         {"region": "US"},
         {"try_previous_locales": True},
-        {"settings": {"DATE_ORDER": "DMY"}},
-        # The default value, but then no longer the date order of the locale.
-        {"settings": {"DATE_ORDER": "MDY"}},
+        {"settings": {"DATE_ORDER": "YMD"}},
+        {"settings": {"DATE_ORDER": "YDM"}},
         {"settings": {"PREFER_LOCALE_DATE_ORDER": False}},
         {"settings": {"RETURN_TIME_AS_PERIOD": True}},
         {"settings": {"RELATIVE_BASE": datetime(2020, 1, 1)}},
@@ -235,6 +296,8 @@ def test_shortcut_follows_changes_of_the_settings(
     assert parser._reads_directly()
     parser._settings.REQUIRE_PARTS.append("year")
     assert parser._reads_directly()
+    # Not through the settings argument, so the date order of the locale
+    # still applies, and a different value here must not go unnoticed.
     monkeypatch.setattr(parser._settings, "DATE_ORDER", "DMY")
     assert not parser._reads_directly()
 

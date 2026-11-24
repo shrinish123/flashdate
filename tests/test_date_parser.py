@@ -2253,6 +2253,9 @@ class TestDateParser(BaseTestCase):
 
         self.date_parser = Mock(wraps=date_parser)
         self.add_patch(patch("flashdate.date.date_parser", new=self.date_parser))
+        # These tests are about the parsers. The shortcut for the dates that
+        # need not go through them has its own tests, in test_shortcut.py.
+        self.add_patch(patch("flashdate.date._SHORTCUT", new=False))
         self.parser = DateDataParser(*args, **kwds)
 
     def when_date_is_parsed(self, date_string: str) -> None:
