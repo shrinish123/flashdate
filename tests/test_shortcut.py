@@ -4,7 +4,7 @@ must give the same outcome."""
 
 import calendar
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -327,3 +327,65 @@ def test_shortcut_gives_way_before_the_year_1000(
     with_shortcut = flashdate.parse("2023-11-05")
     monkeypatch.setattr(date, "_SHORTCUT", False)
     assert with_shortcut == flashdate.parse("2023-11-05")
+
+
+class _FixedDatetime(datetime):
+    @classmethod
+    def now(cls, tz: Any = None) -> "_FixedDatetime":
+        fixed = datetime(2026, 11, 24, 12, 34, 56, tzinfo=timezone.utc)
+        return cls.fromtimestamp(fixed.timestamp(), tz)
+
+
+RELATIVE_STRINGS = [
+    f"{form}".format(amount=amount, unit=unit)
+    for unit in ("second", "minutes", "hour", "days", "week", "months", "year")
+    for amount in (0, 1, 2, 30, 365, 1000, "007", 999999)
+    for form in (
+        "{amount} {unit} ago",
+        "in {amount} {unit}",
+        "{amount} {unit} AGO",
+        "In {amount} {unit}",
+    )
+] + [
+    # Not read directly.
+    "3 days",
+    "3  days ago",
+    "3 days ago ",
+    "3.5 days ago",
+    "3 hrs ago",
+    "about 3 days ago",
+    "3 days ago at 5pm",
+    "1234567 days ago",
+    "in 3 days time",
+    "hace 3 días",
+]
+
+
+@pytest.mark.parametrize(
+    "configuration", [CONFIGURATIONS[0], CONFIGURATIONS[3], CONFIGURATIONS[9]]
+)
+def test_shortcut_gives_the_outcome_of_the_parsers_for_relative_dates(
+    monkeypatch: pytest.MonkeyPatch, configuration: dict[str, Any]
+) -> None:
+    monkeypatch.setattr("flashdate.freshness_date_parser.datetime", _FixedDatetime)
+    parser = DateDataParser(**configuration)
+    assert parser._reads_directly()
+    read = 0
+    for string in RELATIVE_STRINGS:
+        with_shortcut = _outcome(parser, string)
+        with monkeypatch.context() as context:
+            context.setattr(date, "_SHORTCUT", False)
+            assert with_shortcut == _outcome(parser, string), string
+        read += with_shortcut[0] is not None
+    assert read > 150
+
+
+def test_shortcut_reads_relative_dates(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the parsers should not be needed")
+
+    monkeypatch.setattr("flashdate.freshness_date_parser.datetime", _FixedDatetime)
+    monkeypatch.setattr(DateDataParser, "_get_date_data", fail)
+    now = _FixedDatetime.now().replace(tzinfo=None)
+    assert flashdate.parse("3 days ago") == now - timedelta(days=3)
+    assert flashdate.parse("in 2 hours") == now + timedelta(hours=2)

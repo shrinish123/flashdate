@@ -602,6 +602,14 @@ _TEXT = stdlib_re.compile(
     rf"(?: (GMT|UTC|{_TIME_ZONE}))?)?",
     stdlib_re.IGNORECASE | stdlib_re.ASCII,
 )
+# E.g. "3 days ago" or "in 2 weeks": the relative date parser reads them as it
+# does after language detection and translation.
+_RELATIVE_UNIT = "(second|minute|hour|day|week|month|year)s?"
+_RELATIVE = stdlib_re.compile(
+    rf"(?:([0-9]{{1,6}}) {_RELATIVE_UNIT} ago|in ([0-9]{{1,6}}) {_RELATIVE_UNIT})",
+    stdlib_re.IGNORECASE | stdlib_re.ASCII,
+)
+_VALID_PERIODS = frozenset({"time", "day", "week", "month", "year"})
 _SHORTCUT = True
 _DEFAULT_SETTINGS_VALUES = copy.deepcopy(vars(_default_settings))
 # The settings that may differ from their default values: time zones are
@@ -748,6 +756,28 @@ def _read_directly(
         locale="en",
         parts=_DATE_PARTS if time is None else _DATE_TIME_PARTS,
     )
+
+
+def _read_relative(
+    match: "stdlib_re.Match[str]", settings: Settings
+) -> "DateData | None":
+    """Return the date data of a date string that :data:`_RELATIVE` matches,
+    or ``None`` if the relative date parser cannot read it, in which case it
+    has to go through the parsers."""
+    ago, unit_ago, ahead, unit_ahead = match.groups()
+    if ago is not None:
+        translated = f"{ago} {unit_ago.lower()} ago"
+    else:
+        translated = f"in {ahead} {unit_ahead.lower()}"
+    try:
+        date_data = freshness_date_parser.get_date_data(translated, settings)
+    except Exception:
+        # E.g. a date out of range, which other parsers may read otherwise.
+        return None
+    if not date_data.date_obj or date_data.period not in _VALID_PERIODS:
+        return None
+    date_data.locale = "en"
+    return date_data
 
 
 def _same_outcome(date_data: "DateData", other: "DateData") -> bool:
@@ -1211,7 +1241,7 @@ class DateDataParser:
         )
         return allowed
 
-    def get_date_data(
+    def get_date_data(  # noqa: PLR0912
         self, date_string: str, date_formats: Iterable[str] | None = None
     ) -> DateData:
         """
@@ -1275,9 +1305,17 @@ class DateDataParser:
 
         match = None
         if _SHORTCUT and not date_formats:
-            match = _NUMERIC.fullmatch(date_string) or _TEXT.fullmatch(date_string)
+            match = (
+                _NUMERIC.fullmatch(date_string)
+                or _TEXT.fullmatch(date_string)
+                or _RELATIVE.fullmatch(date_string)
+            )
         if match is None or not self._reads_directly():
             return self._get_date_data(date_string, date_formats)
+        if match.re is _RELATIVE:
+            return _read_relative(match, self._settings) or self._get_date_data(
+                date_string, date_formats
+            )
         suffix = match.group(match.re.groups)
         tz: tuple[str, timedelta] | None = None
         if suffix == "Z":

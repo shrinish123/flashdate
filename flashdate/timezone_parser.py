@@ -198,6 +198,9 @@ class _TzRegexes(NamedTuple):
     no groups and shares the common prefixes of the names; the index of the
     first timezone with each lowercase name; and whether the matches of both
     patterns are the same. ``None`` for other families."""
+    signed: list[bool]
+    """For each family, whether every match of its pattern has a plus or minus
+    sign, because all its timezones are UTC offsets."""
 
 
 _tz_regexes_lock = threading.Lock()
@@ -207,6 +210,11 @@ def _tz_regexes() -> _TzRegexes:
     """Return the timezone regexes, compiled on first use."""
     with _tz_regexes_lock:
         return _build_tz_regexes()
+
+
+# A UTC offset, after "UTC" or "GMT" if any: whatever matches a pattern that
+# starts like this has a plus or minus sign.
+_SIGNED_OFFSET = re.compile(r"(?:\(\?:UTC\|GMT\)|UTC|GMT|\(\?<=\\s\))?\\[+-][0-9]")
 
 
 # Timezone names made of letters can only match this template in one way at
@@ -245,6 +253,7 @@ def _prefix_tree_pattern(words: "Iterable[str]") -> str:
 def _build_tz_regexes() -> _TzRegexes:
     families: list[tuple[regex.Pattern[str], list[tuple[str, timedelta]]]] = []
     literal: list[tuple[regex.Pattern[str], dict[str, int], bool] | None] = []
+    signed: list[bool] = []
     names: list[str] = []
     for tz_info in timezone_info_list:
         for template in tz_info["regex_patterns"]:
@@ -268,6 +277,12 @@ def _build_tz_regexes() -> _TzRegexes:
                 template % f"(?:{'|'.join(alternatives)})", flags, cache_pattern=False
             )
             families.append((pattern, timezones))
+            signed.append(
+                all(
+                    _SIGNED_OFFSET.match(alternative, alternative.index(">") + 1)
+                    for alternative in alternatives
+                )
+            )
             variants_seen = [
                 alternative[alternative.index(">") + 1 : -1]
                 for alternative in alternatives
@@ -306,6 +321,7 @@ def _build_tz_regexes() -> _TzRegexes:
         re.compile(names_pattern),
         re.compile(names_pattern, re.IGNORECASE),
         literal,
+        signed,
     )
 
 
@@ -345,9 +361,13 @@ def _find_tz(  # noqa: PLR0912
     template, the earliest timezone wins, and ties go to the leftmost match.
     """
     tz_regexes = _tz_regexes()
-    for (pattern, timezones), literal in zip(
-        tz_regexes.families, tz_regexes.literal, strict=True
+    unsigned = "+" not in string and "-" not in string
+    for (pattern, timezones), literal, signed in zip(
+        tz_regexes.families, tz_regexes.literal, tz_regexes.signed, strict=True
     ):
+        if signed and unsigned:
+            # Most date strings have no UTC offset to look for.
+            continue
         best: tuple[int, tuple[int, int]] | None = None
         if literal is not None:
             literal_pattern, first_index, same_matches = literal

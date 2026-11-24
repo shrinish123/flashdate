@@ -39,8 +39,11 @@ def _get_localzone() -> tzinfo:
         raise
 
 
+_BRACES = re.compile(r"[{}()<>\[\]]+")
+
+
 def strip_braces(date_string: str) -> str:
-    return re.sub(r"[{}()<>\[\]]+", "", date_string)
+    return _BRACES.sub("", date_string)
 
 
 def normalize_unicode(

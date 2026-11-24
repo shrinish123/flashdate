@@ -28,6 +28,13 @@ PATTERN = re.compile(
     rf"(?<![\d/.:])((?:[+-]\s*+)?\d++[.,]?\d*+)\s*({_UNITS})\b", re.I | re.S | re.U
 )
 _GLUED_QUANTITY = re.compile(rf"\d\s*(?:{_UNITS})\b", re.I)
+_SPACES = re.compile(r"\s+")
+_AGO_OR_IN = re.compile(r"\b(?:ago|in)\b")
+_AGO = re.compile(r"\bago\b")
+_IN = re.compile(r"\bin\b")
+_FUTURE = re.compile(r"\bfuture\b")
+_NON_WORD = re.compile(r"\W")
+_SKIPPED_WORD = re.compile(rf"{_UNITS}|ago|in|\d+|:|[ap]m")
 # The time zone settings, and whether the date string has no time zone, for
 # which working out the current time is known not to fail, e.g. because the
 # time zone does not exist. Only then can the current time go unused.
@@ -41,21 +48,19 @@ class FreshnessDateDataParser:
     """Parses date string like "1 year, 2 months ago" and "3 hours, 50 minutes ago"."""
 
     def _are_all_words_units(self, date_string: str) -> bool:
-        skip = [_UNITS, r"ago|in|\d+", r":|[ap]m"]
-
         if _GLUED_QUANTITY.search(PATTERN.sub("", date_string)):
             return False
 
-        date_string = re.sub(r"\s+", " ", date_string.strip())
+        date_string = _SPACES.sub(" ", date_string.strip())
 
-        words = [x for x in re.split(r"\W", date_string) if x]
-        words = [x for x in words if not re.match("|".join(skip), x)]
+        words = [x for x in _NON_WORD.split(date_string) if x]
+        words = [x for x in words if not _SKIPPED_WORD.match(x)]
         return not words
 
     def _parse_time(self, date_string: str, settings: "Settings") -> time | None:
         """Attempts to parse time part of date strings like '1 day ago, 2 PM'"""
         date_string = PATTERN.sub("", date_string)
-        date_string = re.sub(r"\b(?:ago|in)\b", "", date_string)
+        date_string = _AGO_OR_IN.sub("", date_string)
         with contextlib.suppress(Exception):
             return time_parser(date_string)
         return None
@@ -207,9 +212,8 @@ class FreshnessDateDataParser:
                     }.get(k, k[:-1])
                     break
 
-        going_forward = re.search(r"\bin\b", date_string) or (
-            re.search(r"\bfuture\b", prefer_dates_from)
-            and not re.search(r"\bago\b", date_string)
+        going_forward = _IN.search(date_string) or (
+            _FUTURE.search(prefer_dates_from) and not _AGO.search(date_string)
         )
 
         adjusted_kwargs: dict[str, Any] = {}
