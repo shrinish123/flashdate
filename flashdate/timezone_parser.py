@@ -2,8 +2,8 @@ import re
 import threading
 import warnings
 from datetime import datetime, timedelta, timezone, tzinfo
-from functools import cache
-from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, overload
+from functools import cache, lru_cache
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypedDict, overload
 
 import regex
 
@@ -192,6 +192,11 @@ class _TzRegexes(NamedTuple):
     """Matches any timezone name."""
     names_ignorecase: re.Pattern[str]
     """Matches any timezone name, case-insensitively."""
+    literal: list[tuple[regex.Pattern[str], dict[str, int]] | None] = []
+    """For each family whose timezone names are plain words, a pattern that
+    matches the same strings as the family pattern but faster, because it has
+    no groups and shares the common prefixes of the names, and the index of
+    the first timezone with each lowercase name. ``None`` for other families."""
 
 
 _tz_regexes_lock = threading.Lock()
@@ -203,9 +208,36 @@ def _tz_regexes() -> _TzRegexes:
         return _build_tz_regexes()
 
 
+def _prefix_tree_pattern(words: "Iterable[str]") -> str:
+    """Return a pattern that matches the same strings as an alternation of
+    *words*, which must be plain words, without trying every one of them."""
+    tree: dict[str, Any] = {}
+    for word in words:
+        node = tree
+        for character in word:
+            node = node.setdefault(character, {})
+        node[""] = {}
+
+    def pattern(node: dict[str, Any]) -> str:
+        branches = [
+            regex.escape(character) + pattern(child)
+            for character, child in node.items()
+            if character
+        ]
+        if not branches:
+            return ""
+        joined = branches[0] if len(branches) == 1 else f"(?:{'|'.join(branches)})"
+        if "" in node:
+            return f"(?:{joined})?"
+        return joined
+
+    return pattern(tree)
+
+
 @cache
 def _build_tz_regexes() -> _TzRegexes:
     families: list[tuple[regex.Pattern[str], list[tuple[str, timedelta]]]] = []
+    literal: list[tuple[regex.Pattern[str], dict[str, int]] | None] = []
     names: list[str] = []
     for tz_info in timezone_info_list:
         for template in tz_info["regex_patterns"]:
@@ -229,15 +261,43 @@ def _build_tz_regexes() -> _TzRegexes:
                 template % f"(?:{'|'.join(alternatives)})", flags, cache_pattern=False
             )
             families.append((pattern, timezones))
+            variants_seen = [alternative[alternative.index(">") + 1 : -1] for alternative in alternatives]
+            # Lowercasing has to tell the names apart exactly as ignoring
+            # their case does for the index of a name to be known from its
+            # lowercase text.
+            if all(variant.isalpha() for variant in variants_seen) and len(
+                {variant.lower() for variant in variants_seen}
+            ) == len({variant.casefold() for variant in variants_seen}) and all(
+                variant.lower() == variant.casefold() for variant in variants_seen
+            ):
+                first_index: dict[str, int] = {}
+                for index, variant in enumerate(variants_seen):
+                    first_index.setdefault(variant.lower(), index)
+                literal.append(
+                    (
+                        regex.compile(
+                            template % _prefix_tree_pattern(variants_seen),
+                            flags,
+                            cache_pattern=False,
+                        ),
+                        first_index,
+                    )
+                )
+            else:
+                literal.append(None)
     # Only used for anchored matching, which re compiles and runs faster.
     names_pattern = "|".join(names)
     return _TzRegexes(
         families,
         re.compile(names_pattern),
         re.compile(names_pattern, re.IGNORECASE),
+        literal,
     )
 
 
+# A date string is searched several times while it is parsed, once per parser
+# that reads timezones.
+@lru_cache(maxsize=256)
 def _find_tz(
     string: str,
 ) -> tuple[tuple[int, int], str, timedelta] | None:
@@ -247,7 +307,15 @@ def _find_tz(
     Earlier pattern templates take precedence over later ones. Within a
     template, the earliest timezone wins, and ties go to the leftmost match.
     """
-    for pattern, timezones in _tz_regexes().families:
+    tz_regexes = _tz_regexes()
+    for (pattern, timezones), literal in zip(
+        tz_regexes.families, tz_regexes.literal, strict=True
+    ):
+        first_index: dict[str, int] = {}
+        if literal is not None:
+            if not literal[0].search(string):
+                continue
+            first_index = literal[1]
         matches: Iterable[regex.Match[str]]
         if pattern.flags & regex.REVERSE:
             match = pattern.search(string)
@@ -262,10 +330,15 @@ def _find_tz(
         indexes: dict[str, int] = {}
         for match in matches:
             text = string[match.end(1) : match.start(pattern.groups)].lower()
-            if text not in indexes:
-                group = next(k for k, v in match.groupdict().items() if v is not None)
-                indexes[text] = int(group[2:])
-            index = indexes[text]
+            if text in first_index:
+                index = first_index[text]
+            else:
+                if text not in indexes:
+                    group = next(
+                        k for k, v in match.groupdict().items() if v is not None
+                    )
+                    indexes[text] = int(group[2:])
+                index = indexes[text]
             if best is None or index < best[0]:
                 best = (index, match.span())
         if best:

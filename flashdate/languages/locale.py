@@ -164,6 +164,10 @@ class Locale:
         # This locale instance is cached and shared across threads; the lock
         # guards lazy initialisation of the cached attributes below.
         self._lock = threading.RLock()
+        # The last date string split into tokens: checking that this locale
+        # is applicable to a date string and translating it split it the same
+        # way, one after the other.
+        self._last_split: tuple[Any, str, bool, list[str]] | None = None
 
     @cached_property
     def _native(self) -> "Locale":
@@ -206,13 +210,9 @@ class Locale:
                 date_string, as_offset=False, settings=settings
             )
 
-        date_string = self._translate_numerals(date_string)
         assert settings is not None
-        if settings.NORMALIZE:
-            date_string = normalize_unicode(date_string)
-        date_string = self._simplify(date_string, settings=settings)
         dictionary = self._get_dictionary(settings)
-        date_tokens = dictionary.split(date_string)
+        date_tokens = self._split_simplified(date_string, settings, dictionary)
         if ignore_surrounding_text:
             date_tokens = dictionary._strip_unknown_edge_tokens(date_tokens)
         return dictionary.are_tokens_valid(date_tokens)
@@ -321,13 +321,11 @@ class Locale:
         or ``None`` if there is no such combination."""
         if alternative >= _MAX_TRANSLATIONS:
             return None
-        date_string = self._translate_numerals(date_string)
         assert settings is not None
-        if settings.NORMALIZE:
-            date_string = normalize_unicode(date_string)
-        date_string = self._simplify(date_string, settings=settings)
         dictionary = self._get_dictionary(settings)
-        date_string_tokens = dictionary.split(date_string, keep_formatting)
+        date_string_tokens = self._split_simplified(
+            date_string, settings, dictionary, keep_formatting
+        )
         if ignore_surrounding_text:
             date_string_tokens = dictionary._strip_unknown_edge_tokens(
                 date_string_tokens
@@ -418,6 +416,30 @@ class Locale:
             separator="" if keep_formatting else " ",
             settings=settings,
         )
+
+    def _split_simplified(
+        self,
+        date_string: str,
+        settings: "Settings",
+        dictionary: "Dictionary",
+        keep_formatting: bool = False,
+    ) -> list[str]:
+        """Return the tokens of *date_string* after simplifying it."""
+        last = self._last_split
+        if (
+            last is not None
+            and last[1] == date_string
+            and last[0] is settings
+            and last[2] is keep_formatting
+        ):
+            return list(last[3])
+        simplified = self._translate_numerals(date_string)
+        if settings.NORMALIZE:
+            simplified = normalize_unicode(simplified)
+        simplified = self._simplify(simplified, settings=settings)
+        tokens = dictionary.split(simplified, keep_formatting)
+        self._last_split = (settings, date_string, keep_formatting, tokens.copy())
+        return tokens
 
     def _translate_numerals(self, date_string: str) -> str:
         date_string_tokens = NUMERAL_PATTERN.split(date_string)

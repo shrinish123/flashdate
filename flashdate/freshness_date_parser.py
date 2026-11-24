@@ -73,7 +73,12 @@ class FreshnessDateDataParser:
         if match := _DAY_OF_MONTH.match(date_string):
             day = int(match[1])
             date_string = date_string[match.end() :]
-        _time = self._parse_time(date_string, settings)
+        # Without a quantity there is no relative date for the time to apply to.
+        _time = (
+            self._parse_time(date_string, settings)
+            if PATTERN.search(date_string)
+            else None
+        )
 
         _settings_tz = settings.TIMEZONE.lower()
 
@@ -162,6 +167,9 @@ class FreshnessDateDataParser:
         prefer_dates_from: str,
         return_time_as_period: bool,
     ) -> tuple[datetime, str, tuple[str, ...]] | tuple[None, None, tuple[()]]:
+        # Without a quantity there is nothing to read, whatever the words.
+        if not PATTERN.search(date_string):
+            return None, None, ()
         if not self._are_all_words_units(date_string):
             return None, None, ()
 
