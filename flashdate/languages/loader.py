@@ -18,6 +18,7 @@ from .locale import Locale
 LOCALE_SPLIT_PATTERN = re.compile(r"-(?=[A-Z0-9]+$)")
 
 _LANGUAGE_POSITIONS = {language: i for i, language in enumerate(language_order)}
+_MAX_RESOLVED_LOCALES = 256
 
 
 def _isvalidlocale(locale: str) -> bool:
@@ -46,6 +47,7 @@ class LocaleDataLoader:
     _loaded_languages: ClassVar[dict[str, dict[str, Any]]] = {}
     _loaded_locales: ClassVar[dict[str, Locale]] = {}
     _load_lock = threading.Lock()
+    _resolved_locales: ClassVar[dict[tuple[Any, ...], dict[str, tuple[str, ...]]]] = {}
 
     def get_locale_map(
         self,
@@ -155,7 +157,7 @@ class LocaleDataLoader:
         """
         return next(iter(self.get_locales(locales=[shortname])))
 
-    def _load_data(  # noqa: PLR0912
+    def _load_data(
         self,
         languages: Iterable[str] | None = None,
         locales: Iterable[str] | None = None,
@@ -163,6 +165,71 @@ class LocaleDataLoader:
         use_given_order: bool = False,
         allow_conflicting_locales: bool = False,
     ) -> Iterator[tuple[str, Locale]]:
+        # The same arguments are resolved for every date string of a parser.
+        key: tuple[Any, ...] | None = None
+        locale_dict: dict[str, tuple[str, ...]] | None = None
+        if (languages is None or type(languages) in (list, tuple)) and (
+            locales is None or type(locales) in (list, tuple)
+        ):
+            key = (
+                None if languages is None else tuple(languages),
+                None if locales is None else tuple(locales),
+                region,
+                bool(use_given_order),
+                bool(allow_conflicting_locales),
+            )
+            try:
+                locale_dict = self._resolved_locales.get(key)
+            except TypeError:  # unhashable values
+                key = None
+        if locale_dict is None:
+            locale_dict = self._resolve_locales(
+                languages, locales, region, use_given_order, allow_conflicting_locales
+            )
+            if key is not None:
+                if len(self._resolved_locales) >= _MAX_RESOLVED_LOCALES:
+                    self._resolved_locales.clear()
+                self._resolved_locales[key] = locale_dict
+
+        for shortname, lang_reg in locale_dict.items():
+            loaded = self._loaded_locales.get(shortname)
+            if loaded is not None:
+                yield shortname, loaded
+                continue
+            with self._load_lock:
+                if shortname not in self._loaded_locales:
+                    lang, _reg = lang_reg
+                    if lang in self._loaded_languages:
+                        locale_obj = Locale(
+                            shortname,
+                            language_info=deepcopy(self._loaded_languages[lang]),
+                        )
+                    else:
+                        language_info = (
+                            import_module(
+                                "flashdate.data.date_translation_data." + lang
+                            )
+                        ).info
+                        locale_obj = Locale(
+                            shortname, language_info=deepcopy(language_info)
+                        )
+                        self._loaded_languages[lang] = language_info
+                    # Store only once fully built so concurrent readers never see
+                    # a half-initialised locale.
+                    self._loaded_locales[shortname] = locale_obj
+                locale_obj = self._loaded_locales[shortname]
+            yield shortname, locale_obj
+
+    @staticmethod
+    def _resolve_locales(  # noqa: PLR0912
+        languages: Iterable[str] | None,
+        locales: Iterable[str] | None,
+        region: str | None,
+        use_given_order: bool,
+        allow_conflicting_locales: bool,
+    ) -> dict[str, tuple[str, ...]]:
+        """Return the names of the locales to load, in the order to try them,
+        each with its language and region."""
         locale_dict: dict[str, tuple[str, ...]] = {}
         if locales:
             locales = [_normalize_locale(locale) for locale in locales]
@@ -207,30 +274,7 @@ class LocaleDataLoader:
                 sorted(locale_dict.items(), key=lambda x: _LANGUAGE_POSITIONS[x[1][0]])
             )
 
-        for shortname, lang_reg in locale_dict.items():
-            with self._load_lock:
-                if shortname not in self._loaded_locales:
-                    lang, _reg = lang_reg
-                    if lang in self._loaded_languages:
-                        locale_obj = Locale(
-                            shortname,
-                            language_info=deepcopy(self._loaded_languages[lang]),
-                        )
-                    else:
-                        language_info = (
-                            import_module(
-                                "flashdate.data.date_translation_data." + lang
-                            )
-                        ).info
-                        locale_obj = Locale(
-                            shortname, language_info=deepcopy(language_info)
-                        )
-                        self._loaded_languages[lang] = language_info
-                    # Store only once fully built so concurrent readers never see
-                    # a half-initialised locale.
-                    self._loaded_locales[shortname] = locale_obj
-                locale_obj = self._loaded_locales[shortname]
-            yield shortname, locale_obj
+        return locale_dict
 
 
 default_loader = LocaleDataLoader()

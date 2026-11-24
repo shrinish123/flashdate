@@ -144,6 +144,35 @@ def strptime(
     date_string, prepared_format, day_of_year_in_format = _prepare_format(
         date_string, format, reference_year
     )
+    if "%Z" in prepared_format:
+        # The time zone names that %Z reads may change with the process time
+        # zone.
+        return _strptime(date_string, prepared_format, day_of_year_in_format)
+    result = _strptime_cached(date_string, prepared_format, day_of_year_in_format)
+    if type(result) is tuple:
+        raise ValueError(*result)
+    return result  # type: ignore[return-value]
+
+
+# Reading a date tries the same few directives on the same few numbers and
+# names over and over, e.g. "05" as a month, as a day and as a year.
+@lru_cache(maxsize=4096)
+def _strptime_cached(
+    date_string: str, prepared_format: str, day_of_year_in_format: bool
+) -> datetime | tuple[Any, ...]:
+    """Return the outcome of :func:`_strptime`: the date, or the arguments of
+    the :class:`ValueError` that it raises."""
+    try:
+        return _strptime(date_string, prepared_format, day_of_year_in_format)
+    except ValueError as error:
+        if type(error) is not ValueError:
+            raise
+        return error.args
+
+
+def _strptime(
+    date_string: str, prepared_format: str, day_of_year_in_format: bool
+) -> datetime:
     time_tuple = __strptime(date_string, prepared_format)
     obj = datetime(*time_tuple[:-3])
     if time_tuple.tm_gmtoff is not None:

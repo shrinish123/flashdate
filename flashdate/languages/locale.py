@@ -14,6 +14,7 @@ from flashdate.timezone_parser import (
     word_is_tz,
 )
 from flashdate.utils import combine_dicts, normalize_unicode
+from flashdate.utils.letters import is_letter_free, requires_letter
 
 from .dictionary import (
     ALWAYS_KEEP_TOKENS,
@@ -168,6 +169,9 @@ class Locale:
         # is applicable to a date string and translating it split it the same
         # way, one after the other.
         self._last_split: tuple[Any, str, bool, list[str]] | None = None
+        # What is known about the letters that the patterns of this locale
+        # require, by the identity of the collection of patterns.
+        self._letter_requirements: dict[int, tuple[Any, Any]] = {}
 
     @cached_property
     def _native(self) -> "Locale":
@@ -343,24 +347,28 @@ class Locale:
             for token in date_string_tokens
         )
 
+        # Most tokens are numbers and separators, which relative translations
+        # cannot match if all of them require a letter.
+        relative_requires_letter = self._all_require_letter(relative_translations)
         for i, token in enumerate(date_string_tokens):
             word = token.lower()
-            for pattern, replacement in relative_translations.items():
-                if pattern.match(word):
-                    date_string_tokens[i] = pattern.sub(replacement, word)
-                    break
-            else:
-                if (
-                    has_unambiguous_month
-                    and word in dictionary._weekday_month_conflicts
-                ):
-                    date_string_tokens[i] = dictionary._weekday_month_conflicts[word]
-                elif word in dictionary:
-                    fallback = word if keep_formatting and not word.isalpha() else ""
-                    date_string_tokens[i] = dictionary[word] or fallback
-                    meanings = dictionary._get_meanings(word)
-                    if len(meanings) > 1:
-                        ambiguous_tokens[i] = meanings
+            if not (relative_requires_letter and is_letter_free(word)):
+                translated = False
+                for pattern, replacement in relative_translations.items():
+                    if pattern.match(word):
+                        date_string_tokens[i] = pattern.sub(replacement, word)
+                        translated = True
+                        break
+                if translated:
+                    continue
+            if has_unambiguous_month and word in dictionary._weekday_month_conflicts:
+                date_string_tokens[i] = dictionary._weekday_month_conflicts[word]
+            elif word in dictionary:
+                fallback = word if keep_formatting and not word.isalpha() else ""
+                date_string_tokens[i] = dictionary[word] or fallback
+                meanings = dictionary._get_meanings(word)
+                if len(meanings) > 1:
+                    ambiguous_tokens[i] = meanings
         if alternative:
             combinations = product(*ambiguous_tokens.values())
             combination = next(islice(combinations, alternative, None), None)
@@ -993,17 +1001,66 @@ class Locale:
     def _apply_simplifications(
         self,
         date_string: str,
-        simplifications: Iterable[Mapping[re.Pattern[str], str]],
+        simplifications: Sequence[Mapping[re.Pattern[str], str]],
     ) -> str:
-        for simplification in simplifications:
+        start = 0
+        if is_letter_free(date_string):
+            # Only the simplifications that do not require a letter can apply,
+            # until one of them adds letters.
+            for index in self._simplifications_for_letter_free(simplifications):
+                pattern, replacement = next(iter(simplifications[index].items()))
+                date_string = pattern.sub(replacement, date_string).lower()
+                if not is_letter_free(date_string):
+                    start = index + 1
+                    break
+            else:
+                return date_string
+        for simplification in islice(simplifications, start, None):
             pattern, replacement = next(iter(simplification.items()))
             date_string = pattern.sub(replacement, date_string).lower()
         return date_string
 
+    def _simplifications_for_letter_free(
+        self, simplifications: Sequence[Mapping[re.Pattern[str], str]]
+    ) -> tuple[int, ...]:
+        """Return the indexes of the *simplifications* that may apply to a
+        string for which :func:`is_letter_free` is true."""
+        known = self._letter_requirements.get(id(simplifications))
+        if known is None or known[0] is not simplifications:
+            indexes = tuple(
+                index
+                for index, simplification in enumerate(simplifications)
+                if not all(requires_letter(p.pattern) for p in simplification)
+            )
+            known = self._remember_letter_requirement(simplifications, indexes)
+        result: tuple[int, ...] = known[1]
+        return result
+
+    def _all_require_letter(self, patterns: Iterable[re.Pattern[str]]) -> bool:
+        """Return whether none of *patterns* can match a string for which
+        :func:`is_letter_free` is true."""
+        known = self._letter_requirements.get(id(patterns))
+        if known is None or known[0] is not patterns:
+            known = self._remember_letter_requirement(
+                patterns, all(requires_letter(p.pattern) for p in patterns)
+            )
+        result: bool = known[1]
+        return result
+
+    def _remember_letter_requirement(
+        self, patterns: Any, requirement: Any
+    ) -> tuple[Any, Any]:
+        # The collections of patterns of a locale are few and live as long as
+        # it does; anything else is forgotten.
+        if len(self._letter_requirements) >= 8:
+            self._letter_requirements.clear()
+        known = self._letter_requirements[id(patterns)] = (patterns, requirement)
+        return known
+
     def _process_russian_compound_ordinals(
         self,
         date_string: str,
-        simplifications: Iterable[Mapping[re.Pattern[str], str]],
+        simplifications: Sequence[Mapping[re.Pattern[str], str]],
     ) -> str:
         """Process Russian compound ordinals mathematically (двадцать + первое = 21)."""
         date_string = self._apply_simplifications(date_string, simplifications)

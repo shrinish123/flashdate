@@ -7,14 +7,73 @@ from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, cast
 
 import regex as re
 
-from flashdate.timezone_parser import is_timezone_token
+from flashdate.timezone_parser import _prefix_tree_pattern, is_timezone_token
 from flashdate.utils import normalize_unicode
+from flashdate.utils.letters import is_letter_free, requires_letter
 
 if TYPE_CHECKING:
     from flashdate.conf import Settings
 
 _T = TypeVar("_T")
 _CacheKey = tuple[Any, ...]
+
+_SPLIT_FLAGS = re.UNICODE | re.IGNORECASE | re.DOTALL
+
+
+def _case_variants(character: str) -> set[str]:
+    """Return the characters that *character* may match ignoring case, erring
+    on the side of too many."""
+    variants = {character}
+    pending = [character]
+    while pending:
+        current = pending.pop()
+        for changed in (
+            current.upper(),
+            current.lower(),
+            current.casefold(),
+            current.title(),
+        ):
+            for variant in changed:
+                if variant not in variants:
+                    variants.add(variant)
+                    pending.append(variant)
+    return variants
+
+
+def _known_words_pattern(words: list[str]) -> str:
+    """Return a pattern that matches like the alternation of *words*, which
+    are sorted by length, longest first.
+
+    Trying hundreds of words one by one at every position of a date string is
+    slow. A prefix tree of the words matches the same text, and also tries
+    longer words first, provided that no text can follow two branches of it,
+    i.e. that no two characters that continue the same prefix can match the
+    same character ignoring case."""
+    alternation = "|".join(map(re.escape, words))
+    if not all(words):
+        return alternation
+    tree: dict[str, Any] = {}
+    for word in words:
+        node = tree
+        for character in word:
+            node = node.setdefault(character, {})
+    pending = [tree]
+    while pending:
+        node = pending.pop()
+        seen: set[str] = set()
+        for character, child in node.items():
+            variants = _case_variants(character)
+            if not seen.isdisjoint(variants) or any(
+                re.fullmatch(re.escape(character), other, _SPLIT_FLAGS)
+                or re.fullmatch(re.escape(other), character, _SPLIT_FLAGS)
+                for other in node
+                if other != character
+            ):
+                return alternation
+            seen |= variants
+            pending.append(child)
+    return _prefix_tree_pattern(words)
+
 
 PARSER_HARDCODED_TOKENS = [":", ".", " ", "-", "/"]
 PARSER_KNOWN_TOKENS = ["am", "pm", "UTC", "GMT", "Z", "early_morning"]
@@ -300,10 +359,20 @@ class Dictionary:
         split_relative_regex = self._get_split_relative_regex_cache()
         match_relative_regex = self._get_match_relative_regex_cache()
 
-        tokens: list[Any] = split_relative_regex.split(string)
+        # Relative strings, e.g. "\d+ days ago", do not match text without
+        # letters if they all require one.
+        letter_free = is_letter_free(string)
+        tokens: list[Any]
+        if letter_free and requires_letter(split_relative_regex.pattern):
+            tokens = [string]
+        else:
+            tokens = split_relative_regex.split(string)
+        match_requires_letter = requires_letter(match_relative_regex.pattern)
 
         for i, token in enumerate(tokens):
-            if match_relative_regex.match(token):
+            if not (
+                match_requires_letter and (letter_free or is_letter_free(token))
+            ) and match_relative_regex.match(token):
                 tokens[i] = [token]
                 continue
             tokens[i] = self._split_by_known_words(token, keep_formatting)
@@ -407,16 +476,14 @@ class Dictionary:
             return self._split_regex_cache[self._cache_key][self.info["name"]]
 
     def _construct_split_regex(self) -> None:
-        known_words_group = "|".join(
-            map(re.escape, self._get_sorted_words_from_cache())
-        )
+        known_words_group = _known_words_pattern(self._get_sorted_words_from_cache())
         if self._no_word_spacing:
             regex = rf"(.*?)({known_words_group})"
         else:
             regex = rf"(.*?(?:\G|\W|_|\d))({known_words_group})(?=\Z|\W|_|\d)"
         self._add_to_cache(
             cache=self._split_regex_cache,
-            value=re.compile(regex, re.UNICODE | re.IGNORECASE | re.DOTALL),
+            value=re.compile(regex, _SPLIT_FLAGS),
         )
 
     def _get_sorted_relative_strings_from_cache(self) -> list[str]:
