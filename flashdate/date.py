@@ -18,7 +18,7 @@ from flashdate._parts_of_day import PartOfDay, _replace_part_of_day
 from flashdate.conf import Settings, apply_settings, check_settings
 from flashdate.conf import settings as _default_settings
 from flashdate.custom_language_detection.language_mapping import map_languages
-from flashdate.date_parser import date_parser
+from flashdate.date_parser import _apply_timezone_settings, date_parser
 from flashdate.freshness_date_parser import freshness_date_parser
 from flashdate.languages.loader import LocaleDataLoader
 from flashdate.languages.locale import _MAX_TRANSLATIONS, _VARIANT_LETTERS
@@ -551,62 +551,117 @@ def _translate_names(
         )
 
 
-# ISO 8601 dates and date times that every locale reads the same way, which
-# with the default configuration need not go through language detection,
-# translation and the parsers: the outcome is known from their digits alone.
-_ISO_8601 = stdlib_re.compile(
-    r"([0-9]{4})-([0-9]{2})-([0-9]{2})"
+# Dates and date times made of numbers alone that need not go through language
+# detection, translation and the parsers, because with the configuration that
+# DateDataParser._reads_directly allows the outcome is known from their
+# digits: ISO 8601 ones, which every locale reads the same way, and those with
+# the year last, which are read with the month first, as in English, unless
+# only the day can go first.
+_DIRECT = stdlib_re.compile(
+    r"(?:([0-9]{4})-([0-9]{2})-([0-9]{2})"
+    r"|([0-9]{1,2})([/.])([0-9]{1,2})\5([0-9]{4}))"
     r"(?:[T ]([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.([0-9]{1,6}))?)?"
     r"(Z|[+-][0-9]{2}:?[0-9]{2})?)?"
 )
-_ISO_8601_SHORTCUT = True
+_SHORTCUT = True
 _DEFAULT_SETTINGS_VALUES = copy.deepcopy(vars(_default_settings))
+# The settings that may differ from their default values: time zones are
+# applied as the parsers do, and the rest only matter for incomplete dates.
+_SHORTCUT_SETTINGS = frozenset(
+    {
+        "TIMEZONE",
+        "TO_TIMEZONE",
+        "RETURN_AS_TIMEZONE_AWARE",
+        "PREFER_DATES_FROM",
+        "PREFER_DAY_OF_MONTH",
+        "PREFER_MONTH_OF_YEAR",
+        "STRICT_PARSING",
+        "REQUIRE_PARTS",
+    }
+)
+_SETTINGS_ATTRIBUTES = frozenset(
+    {*_DEFAULT_SETTINGS_VALUES, "_default", "_mod_settings"}
+)
 # The name and offset of the time zone that each UTC offset was read as when
-# an ISO 8601 date time with it went through the parsers.
-_ISO_8601_OFFSETS: dict[str, tuple[str, timedelta]] = {}
-_MAX_ISO_8601_OFFSETS = 512
+# a date string with it went through the parsers.
+_SHORTCUT_OFFSETS: dict[str, tuple[str, timedelta]] = {}
+_MAX_SHORTCUT_OFFSETS = 512
+_DATE_PARTS = ("year", "month", "day")
+_DATE_TIME_PARTS = ("year", "month", "day", "time")
 
 
-def _read_iso_8601(
-    match: "stdlib_re.Match[str]", tz: tuple[str, timedelta] | None
+def _read_directly(
+    match: "stdlib_re.Match[str]",
+    tz: tuple[str, timedelta] | None,
+    settings: Settings,
 ) -> "DateData | None":
-    """Return the date data of an ISO 8601 date string with the default
-    configuration, given its time zone if it has a UTC offset, or ``None`` if
-    it is not a valid date, in which case it has to go through the parsers."""
-    year, month, day, hour, minute, second, fraction, suffix = match.groups()
+    """Return the date data of a date string that :data:`_DIRECT` matches,
+    given its time zone if it has a UTC offset, or ``None`` if it is not a
+    valid date, in which case it has to go through the parsers."""
+    (
+        iso_year,
+        iso_month,
+        iso_day,
+        first,
+        _,
+        second_number,
+        year,
+        hour,
+        minute,
+        second,
+        fraction,
+        _,
+    ) = match.groups()
     try:
         if datetime.today().year < 1000:
             # The parsers read a day of the month along with the current
             # year, which they cannot do if it has less than four digits.
             return None
-        if suffix is None:
-            # The parsers need the local time zone, and fail without it.
-            _get_localzone()
-        if hour is None:
-            return DateData(
-                date_obj=datetime(int(year), int(month), int(day)),
-                period="day",
-                locale="en",
-                parts=("year", "month", "day"),
-            )
-        date_obj = datetime(
-            int(year),
-            int(month),
-            int(day),
-            int(hour),
-            int(minute),
-            int(second) if second else 0,
-            int(fraction.ljust(6, "0")) if fraction else 0,
-            StaticTzInfo(*tz) if tz else None,
+        hours = minutes = seconds = microseconds = 0
+        if hour is not None:
+            hours = int(hour)
+            minutes = int(minute)
+            seconds = int(second) if second else 0
+            microseconds = int(fraction.ljust(6, "0")) if fraction else 0
+        time = (hours, minutes, seconds, microseconds)
+        if iso_year is not None:
+            date_obj = datetime(int(iso_year), int(iso_month), int(iso_day), *time)
+        else:
+            try:
+                date_obj = datetime(int(year), int(first), int(second_number), *time)
+            except ValueError:
+                date_obj = datetime(int(year), int(second_number), int(first), *time)
+        date_obj = _apply_timezone_settings(
+            date_obj, StaticTzInfo(*tz) if tz else None, settings
         )
     except Exception:
+        # Whatever is wrong, e.g. a time zone setting, is for the parsers to
+        # report.
         return None
     return DateData(
         date_obj=date_obj,
         period="day",
         locale="en",
-        parts=("year", "month", "day", "time"),
+        parts=_DATE_PARTS if hour is None else _DATE_TIME_PARTS,
     )
+
+
+def _same_outcome(date_data: "DateData", other: "DateData") -> bool:
+    def outcome(data: "DateData") -> tuple[Any, ...]:
+        date_obj = data.date_obj
+        if date_obj is None:
+            return (None,)
+        return (
+            date_obj.replace(tzinfo=None),
+            type(date_obj.tzinfo),
+            repr(date_obj.tzinfo),
+            date_obj.utcoffset(),
+            data.period,
+            data.locale,
+            data.parts,
+        )
+
+    return outcome(date_data) == outcome(other)
 
 
 class _DateLocaleParser:
@@ -1003,19 +1058,46 @@ class DateDataParser:
         # Guards the per-instance state mutated when a parser is shared by
         # multiple threads (previous_locales and the lazily detected languages).
         self._lock = threading.RLock()
+        # The values of the settings when whether they allow the shortcut was
+        # last worked out, and whether they do.
+        self._shortcut_settings: tuple[dict[str, Any], bool] | None = None
 
-    def _has_default_configuration(self) -> bool:
-        return (
+    def _reads_directly(self) -> bool:
+        """Return whether the configuration is one with which the outcome for
+        the date strings that :data:`_DIRECT` matches is known."""
+        if not (
             type(self) is DateDataParser
-            and self._settings is _default_settings
-            and not self.languages
+            and (not self.languages or self.languages == ["en"])
             and not self.locales
             and not self.region
             and self.detect_languages_function is None
             and self.try_previous_locales is False
             and self.use_given_order is False
-            and vars(_default_settings) == _DEFAULT_SETTINGS_VALUES
+        ):
+            return False
+        values = vars(self._settings)
+        known = self._shortcut_settings
+        if known is not None and known[0] == values:
+            return known[1]
+        allowed = (
+            values.keys() <= _SETTINGS_ATTRIBUTES
+            and all(
+                values.get(name, value) == value
+                for name, value in _DEFAULT_SETTINGS_VALUES.items()
+                if name not in _SHORTCUT_SETTINGS
+            )
+            and _SHORTCUT_SETTINGS.issuperset(self._settings._mod_settings)
         )
+        # The values that can change in place are lists and mappings of
+        # values that cannot.
+        self._shortcut_settings = (
+            {
+                name: value.copy() if isinstance(value, (list, dict, set)) else value
+                for name, value in values.items()
+            },
+            allowed,
+        )
+        return allowed
 
     def get_date_data(
         self, date_string: str, date_formats: Iterable[str] | None = None
@@ -1080,32 +1162,32 @@ class DateDataParser:
             raise TypeError("Input type must be str")
 
         match = None
-        if _ISO_8601_SHORTCUT and not date_formats:
-            match = _ISO_8601.fullmatch(date_string)
-        if match is None or not self._has_default_configuration():
+        if _SHORTCUT and not date_formats:
+            match = _DIRECT.fullmatch(date_string)
+        if match is None or not self._reads_directly():
             return self._get_date_data(date_string, date_formats)
-        suffix = match[8]
+        suffix = match[12]
         tz: tuple[str, timedelta] | None = None
         if suffix == "Z":
             tz = ("Z", timedelta(0))
         elif suffix is not None:
-            tz = _ISO_8601_OFFSETS.get(suffix)
+            tz = _SHORTCUT_OFFSETS.get(suffix)
         if suffix is None or tz is not None:
-            date_data = _read_iso_8601(match, tz)
+            date_data = _read_directly(match, tz, self._settings)
             if date_data is not None:
                 return date_data
         date_data = self._get_date_data(date_string, date_formats)
         if suffix is not None and tz is None:
-            # Remember the time zone that the offset was read as, if reading
+            # Remember the time zone that the offset is read as, if reading
             # the rest of the date string as above gives the same outcome.
-            tzinfo = date_data.date_obj.tzinfo if date_data.date_obj else None
-            if type(tzinfo) is StaticTzInfo:
+            _, tzinfo = pop_tz_offset_from_string(date_string, settings=self._settings)
+            if tzinfo is not None:
                 tz = tzinfo.__getinitargs__()
-                expected = _read_iso_8601(match, tz)
-                if expected is not None and vars(expected) == vars(date_data):
-                    if len(_ISO_8601_OFFSETS) >= _MAX_ISO_8601_OFFSETS:
-                        _ISO_8601_OFFSETS.clear()
-                    _ISO_8601_OFFSETS[suffix] = tz
+                expected = _read_directly(match, tz, self._settings)
+                if expected is not None and _same_outcome(expected, date_data):
+                    if len(_SHORTCUT_OFFSETS) >= _MAX_SHORTCUT_OFFSETS:
+                        _SHORTCUT_OFFSETS.clear()
+                    _SHORTCUT_OFFSETS[suffix] = tz
         return date_data
 
     def _get_date_data(

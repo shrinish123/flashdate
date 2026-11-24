@@ -1,10 +1,42 @@
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, tzinfo
 from typing import Any
 
 from .conf import Settings, apply_settings
 from .timezone_parser import pop_tz_offset_from_string
 from .utils import _get_localzone, apply_timezone, localize_timezone, strip_braces
+
+
+def _apply_timezone_settings(
+    date_obj: datetime, ptz: tzinfo | None, settings: Settings
+) -> datetime:
+    """Return *date_obj*, read from a date string with the time zone *ptz*,
+    if any, in the time zone that *settings* ask for."""
+    _settings_tz = settings.TIMEZONE.lower()
+
+    if ptz:
+        if hasattr(ptz, "localize"):
+            date_obj = ptz.localize(date_obj)
+        else:
+            date_obj = date_obj.replace(tzinfo=ptz)
+        if "local" not in _settings_tz:
+            date_obj = apply_timezone(date_obj, settings.TIMEZONE)
+    elif "local" in _settings_tz:
+        date_obj = date_obj.replace(tzinfo=_get_localzone())
+    else:
+        date_obj = localize_timezone(date_obj, settings.TIMEZONE)
+
+    if settings.TO_TIMEZONE:
+        date_obj = apply_timezone(date_obj, settings.TO_TIMEZONE)
+
+    if not settings.RETURN_AS_TIMEZONE_AWARE or (
+        settings.RETURN_AS_TIMEZONE_AWARE
+        and "default" == settings.RETURN_AS_TIMEZONE_AWARE
+        and not ptz
+    ):
+        date_obj = date_obj.replace(tzinfo=None)
+
+    return date_obj
 
 
 class DateParser:
@@ -49,29 +81,7 @@ class DateParser:
         date_obj, period = result[:2]
         parts = result[2] if len(result) == 3 else ()
 
-        _settings_tz = settings.TIMEZONE.lower()
-
-        if ptz:
-            if hasattr(ptz, "localize"):
-                date_obj = ptz.localize(date_obj)
-            else:
-                date_obj = date_obj.replace(tzinfo=ptz)
-            if "local" not in _settings_tz:
-                date_obj = apply_timezone(date_obj, settings.TIMEZONE)
-        elif "local" in _settings_tz:
-            date_obj = date_obj.replace(tzinfo=_get_localzone())
-        else:
-            date_obj = localize_timezone(date_obj, settings.TIMEZONE)
-
-        if settings.TO_TIMEZONE:
-            date_obj = apply_timezone(date_obj, settings.TO_TIMEZONE)
-
-        if not settings.RETURN_AS_TIMEZONE_AWARE or (
-            settings.RETURN_AS_TIMEZONE_AWARE
-            and "default" == settings.RETURN_AS_TIMEZONE_AWARE
-            and not ptz
-        ):
-            date_obj = date_obj.replace(tzinfo=None)
+        date_obj = _apply_timezone_settings(date_obj, ptz, settings)
 
         return date_obj, period, parts
 
