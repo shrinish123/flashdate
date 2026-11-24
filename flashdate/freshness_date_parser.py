@@ -28,6 +28,11 @@ PATTERN = re.compile(
     rf"(?<![\d/.:])((?:[+-]\s*+)?\d++[.,]?\d*+)\s*({_UNITS})\b", re.I | re.S | re.U
 )
 _GLUED_QUANTITY = re.compile(rf"\d\s*(?:{_UNITS})\b", re.I)
+# The time zone settings, and whether the date string has no time zone, for
+# which working out the current time is known not to fail, e.g. because the
+# time zone does not exist. Only then can the current time go unused.
+_NOW_WORKS: set[tuple[str, bool]] = set()
+_MAX_NOW_WORKS = 64
 # "the 1st of last month" translates to " 1 1 month ago".
 _DAY_OF_MONTH = re.compile(r"^\s*(\d{1,2})\s+(?=(?:in\s+)?\d+\s+month\b)")
 
@@ -73,12 +78,17 @@ class FreshnessDateDataParser:
         if match := _DAY_OF_MONTH.match(date_string):
             day = int(match[1])
             date_string = date_string[match.end() :]
-        # Without a quantity there is no relative date for the time to apply to.
-        _time = (
-            self._parse_time(date_string, settings)
-            if PATTERN.search(date_string)
-            else None
-        )
+        # Without a quantity there is no relative date to read, nor for the
+        # time to apply to.
+        has_quantity = PATTERN.search(date_string) is not None
+        now_key = (settings.TIMEZONE, ptz is None)
+        if (
+            not has_quantity
+            and not settings.RELATIVE_BASE
+            and now_key in _NOW_WORKS
+        ):
+            return None, None, ()
+        _time = self._parse_time(date_string, settings) if has_quantity else None
 
         _settings_tz = settings.TIMEZONE.lower()
 
@@ -118,6 +128,10 @@ class FreshnessDateDataParser:
             now = apply_timezone(utc_dt, settings.TIMEZONE)
         else:
             now = datetime.now(self.get_local_tz())
+        if not settings.RELATIVE_BASE:
+            if len(_NOW_WORKS) >= _MAX_NOW_WORKS:
+                _NOW_WORKS.clear()
+            _NOW_WORKS.add(now_key)
 
         date, period, parts = self._parse_date(
             date_string,
