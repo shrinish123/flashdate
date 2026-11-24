@@ -1,6 +1,8 @@
 import collections
+import copy
 import functools
 import itertools
+import re as stdlib_re
 import threading
 import warnings
 from collections.abc import Callable, Iterable, Iterator
@@ -14,13 +16,14 @@ from dateutil.relativedelta import relativedelta
 
 from flashdate._parts_of_day import PartOfDay, _replace_part_of_day
 from flashdate.conf import Settings, apply_settings, check_settings
+from flashdate.conf import settings as _default_settings
 from flashdate.custom_language_detection.language_mapping import map_languages
 from flashdate.date_parser import date_parser
 from flashdate.freshness_date_parser import freshness_date_parser
 from flashdate.languages.loader import LocaleDataLoader
 from flashdate.languages.locale import _MAX_TRANSLATIONS, _VARIANT_LETTERS
 from flashdate.parser import _parse_absolute, _parse_nospaces, _StrictDateOrderError
-from flashdate.timezone_parser import pop_tz_offset_from_string
+from flashdate.timezone_parser import StaticTzInfo, pop_tz_offset_from_string
 from flashdate.utils import (
     _get_localzone,
     _get_missing_parts,
@@ -548,6 +551,64 @@ def _translate_names(
         )
 
 
+# ISO 8601 dates and date times that every locale reads the same way, which
+# with the default configuration need not go through language detection,
+# translation and the parsers: the outcome is known from their digits alone.
+_ISO_8601 = stdlib_re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})"
+    r"(?:[T ]([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.([0-9]{1,6}))?)?"
+    r"(Z|[+-][0-9]{2}:?[0-9]{2})?)?"
+)
+_ISO_8601_SHORTCUT = True
+_DEFAULT_SETTINGS_VALUES = copy.deepcopy(vars(_default_settings))
+# The name and offset of the time zone that each UTC offset was read as when
+# an ISO 8601 date time with it went through the parsers.
+_ISO_8601_OFFSETS: dict[str, tuple[str, timedelta]] = {}
+_MAX_ISO_8601_OFFSETS = 512
+
+
+def _read_iso_8601(
+    match: "stdlib_re.Match[str]", tz: tuple[str, timedelta] | None
+) -> "DateData | None":
+    """Return the date data of an ISO 8601 date string with the default
+    configuration, given its time zone if it has a UTC offset, or ``None`` if
+    it is not a valid date, in which case it has to go through the parsers."""
+    year, month, day, hour, minute, second, fraction, suffix = match.groups()
+    try:
+        if datetime.today().year < 1000:
+            # The parsers read a day of the month along with the current
+            # year, which they cannot do if it has less than four digits.
+            return None
+        if suffix is None:
+            # The parsers need the local time zone, and fail without it.
+            _get_localzone()
+        if hour is None:
+            return DateData(
+                date_obj=datetime(int(year), int(month), int(day)),
+                period="day",
+                locale="en",
+                parts=("year", "month", "day"),
+            )
+        date_obj = datetime(
+            int(year),
+            int(month),
+            int(day),
+            int(hour),
+            int(minute),
+            int(second) if second else 0,
+            int(fraction.ljust(6, "0")) if fraction else 0,
+            StaticTzInfo(*tz) if tz else None,
+        )
+    except Exception:
+        return None
+    return DateData(
+        date_obj=date_obj,
+        period="day",
+        locale="en",
+        parts=("year", "month", "day", "time"),
+    )
+
+
 class _DateLocaleParser:
     def __init__(
         self,
@@ -943,6 +1004,19 @@ class DateDataParser:
         # multiple threads (previous_locales and the lazily detected languages).
         self._lock = threading.RLock()
 
+    def _has_default_configuration(self) -> bool:
+        return (
+            type(self) is DateDataParser
+            and self._settings is _default_settings
+            and not self.languages
+            and not self.locales
+            and not self.region
+            and self.detect_languages_function is None
+            and self.try_previous_locales is False
+            and self.use_given_order is False
+            and vars(_default_settings) == _DEFAULT_SETTINGS_VALUES
+        )
+
     def get_date_data(
         self, date_string: str, date_formats: Iterable[str] | None = None
     ) -> DateData:
@@ -1005,6 +1079,38 @@ class DateDataParser:
         if not isinstance(date_string, str):
             raise TypeError("Input type must be str")
 
+        match = None
+        if _ISO_8601_SHORTCUT and not date_formats:
+            match = _ISO_8601.fullmatch(date_string)
+        if match is None or not self._has_default_configuration():
+            return self._get_date_data(date_string, date_formats)
+        suffix = match[8]
+        tz: tuple[str, timedelta] | None = None
+        if suffix == "Z":
+            tz = ("Z", timedelta(0))
+        elif suffix is not None:
+            tz = _ISO_8601_OFFSETS.get(suffix)
+        if suffix is None or tz is not None:
+            date_data = _read_iso_8601(match, tz)
+            if date_data is not None:
+                return date_data
+        date_data = self._get_date_data(date_string, date_formats)
+        if suffix is not None and tz is None:
+            # Remember the time zone that the offset was read as, if reading
+            # the rest of the date string as above gives the same outcome.
+            tzinfo = date_data.date_obj.tzinfo if date_data.date_obj else None
+            if type(tzinfo) is StaticTzInfo:
+                tz = tzinfo.__getinitargs__()
+                expected = _read_iso_8601(match, tz)
+                if expected is not None and vars(expected) == vars(date_data):
+                    if len(_ISO_8601_OFFSETS) >= _MAX_ISO_8601_OFFSETS:
+                        _ISO_8601_OFFSETS.clear()
+                    _ISO_8601_OFFSETS[suffix] = tz
+        return date_data
+
+    def _get_date_data(
+        self, date_string: str, date_formats: Iterable[str] | None = None
+    ) -> DateData:
         res = parse_with_formats(date_string, date_formats or [], self._settings)
         if res["date_obj"]:
             return res
