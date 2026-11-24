@@ -192,7 +192,7 @@ class _TzRegexes(NamedTuple):
     """Matches any timezone name."""
     names_ignorecase: re.Pattern[str]
     """Matches any timezone name, case-insensitively."""
-    literal: list[tuple[regex.Pattern[str], dict[str, int], bool] | None] = []
+    literal: list[tuple[regex.Pattern[str], dict[str, int], bool] | None]
     """For each family whose timezone names are plain words: a pattern that
     matches the same strings as the family pattern but faster, because it has
     no groups and shares the common prefixes of the names; the index of the
@@ -268,14 +268,20 @@ def _build_tz_regexes() -> _TzRegexes:
                 template % f"(?:{'|'.join(alternatives)})", flags, cache_pattern=False
             )
             families.append((pattern, timezones))
-            variants_seen = [alternative[alternative.index(">") + 1 : -1] for alternative in alternatives]
+            variants_seen = [
+                alternative[alternative.index(">") + 1 : -1]
+                for alternative in alternatives
+            ]
             # Lowercasing has to tell the names apart exactly as ignoring
             # their case does for the index of a name to be known from its
             # lowercase text.
-            if all(variant.isalpha() for variant in variants_seen) and len(
-                {variant.lower() for variant in variants_seen}
-            ) == len({variant.casefold() for variant in variants_seen}) and all(
-                variant.lower() == variant.casefold() for variant in variants_seen
+            if (
+                all(variant.isalpha() for variant in variants_seen)
+                and len({variant.lower() for variant in variants_seen})
+                == len({variant.casefold() for variant in variants_seen})
+                and all(
+                    variant.lower() == variant.casefold() for variant in variants_seen
+                )
             ):
                 first_index: dict[str, int] = {}
                 for index, variant in enumerate(variants_seen):
@@ -329,7 +335,7 @@ def _matched_timezone(match: regex.Match[str], count: int) -> int:
 # A date string is searched several times while it is parsed, once per parser
 # that reads timezones.
 @lru_cache(maxsize=256)
-def _find_tz(
+def _find_tz(  # noqa: PLR0912
     string: str,
 ) -> tuple[tuple[int, int], str, timedelta] | None:
     """Return the span, name and offset of the timezone found in *string*,
@@ -367,8 +373,8 @@ def _find_tz(
                 continue
         matches: Iterable[regex.Match[str]]
         if pattern.flags & regex.REVERSE:
-            match = pattern.search(string)
-            matches = [match] if match else []
+            last = pattern.search(string)
+            matches = [last] if last else []
         else:
             matches = pattern.finditer(string, overlapped=True)
         for match in matches:

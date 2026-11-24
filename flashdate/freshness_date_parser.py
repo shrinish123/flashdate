@@ -82,11 +82,7 @@ class FreshnessDateDataParser:
         # time to apply to.
         has_quantity = PATTERN.search(date_string) is not None
         now_key = (settings.TIMEZONE, ptz is None)
-        if (
-            not has_quantity
-            and not settings.RELATIVE_BASE
-            and now_key in _NOW_WORKS
-        ):
+        if not has_quantity and not settings.RELATIVE_BASE and now_key in _NOW_WORKS:
             return None, None, ()
         _time = self._parse_time(date_string, settings) if has_quantity else None
 

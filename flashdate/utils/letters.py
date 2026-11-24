@@ -1,13 +1,13 @@
-"""What the letters of a text tell about the patterns that can match it.
+r"""What the letters of a text tell about the patterns that can match it.
 
-Most patterns of the locale data, e.g. ``(\\d+) days ago``, can only match
+Most patterns of the locale data, e.g. ``(\d+) days ago``, can only match
 text with a letter in it, and only the letters that they spell out. So date
 strings and tokens without letters, e.g. ``2023-11-05``, need not be searched
 with those patterns, and a locale cannot read a date string with a letter
 that none of its words and patterns have.
 """
 
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import regex as re
 
@@ -19,13 +19,16 @@ _LETTERLESS_ESCAPES = frozenset("dsWbBAZzG0123456789")
 _LETTER_ESCAPES = frozenset("wDS")
 _LOOKAROUNDS = ("(?=", "(?!", "(?<=", "(?<!")
 
-# What is known of a part of a pattern: whether every match of it contains a
-# letter that it spells out, and the letters that it spells out outside
-# lookarounds, the only ones that a match of it can contain, or None if it
-# can contain any letter.
+# What is known of a part of a pattern: sets of letters that it spells out
+# such that every match of it contains a letter of each set, and the letters
+# that it spells out outside lookarounds, the only ones that a match of it can
+# contain, or None if it can contain any letter.
+_Required = tuple[frozenset[str], ...]
 _Letters = frozenset[str] | None
-_Reading = tuple[bool, _Letters]
+_Reading = tuple[_Required, _Letters]
 _NOTHING: frozenset[str] = frozenset()
+_MAX_REQUIRED = 12
+_ASCII_NON_LETTERS = {code: None for code in range(128) if not chr(code).isalpha()}
 
 
 def _union(letters: _Letters, more: _Letters) -> _Letters:
@@ -77,6 +80,21 @@ def case_variants(character: str) -> frozenset[str]:
     return frozenset(variants)
 
 
+def letter_key(text: str) -> frozenset[str]:
+    """Return the letters and characters with case of *text*, with their case
+    variants unless they are ASCII, to compare with
+    :func:`required_letters`."""
+    if text.isascii():
+        return frozenset(text.translate(_ASCII_NON_LETTERS))
+    return frozenset().union(
+        *(
+            case_variants(character)
+            for character in set(text)
+            if not is_letter_free(character)
+        )
+    )
+
+
 def requires_letter(pattern: str) -> bool:
     """Return whether every match of *pattern*, a regular expression without
     the ``VERBOSE`` flag, contains a letter that the pattern spells out.
@@ -89,7 +107,25 @@ def requires_letter(pattern: str) -> bool:
     only that a simple reading of the pattern cannot tell.
     """
     reading = _read(pattern)
-    return reading is not None and reading[0]
+    return reading is not None and bool(reading[0])
+
+
+@cache
+def required_letters(pattern: str) -> tuple[frozenset[str], ...]:
+    """Return sets of letters such that every match of *pattern*, a regular
+    expression without the ``VERBOSE`` flag, contains a letter of each set,
+    or a character that matches it ignoring case.
+
+    The sets include the case variants of their letters, so the pattern
+    cannot match in a text if one of the sets and the :func:`letter_key` of
+    the text have nothing in common.
+    """
+    reading = _read(pattern)
+    if reading is None:
+        return ()
+    return tuple(
+        frozenset().union(*map(case_variants, required)) for required in reading[0]
+    )
 
 
 def matched_letters(pattern: str) -> frozenset[str] | None:
@@ -101,7 +137,7 @@ def matched_letters(pattern: str) -> frozenset[str] | None:
     return None if reading is None else reading[1]
 
 
-@lru_cache(maxsize=None)
+@cache
 def _read(pattern: str) -> _Reading | None:
     try:
         required, spelled, end = _alternation(pattern, 0)
@@ -112,22 +148,54 @@ def _read(pattern: str) -> _Reading | None:
     return required, spelled
 
 
-def _alternation(pattern: str, pos: int) -> tuple[bool, _Letters, int]:
+def _alternation(pattern: str, pos: int) -> tuple[_Required, _Letters, int]:
     """Read alternatives from *pos* up to a closing parenthesis or the end of
-    *pattern*. All of them must require a letter for a match to have one."""
+    *pattern*. A match has a letter of a set if every alternative requires
+    one of its letters."""
     required, spelled, pos = _sequence(pattern, pos)
+    if pos == len(pattern) or pattern[pos] != "|":
+        return required, spelled, pos
+    branches = [required]
     while pos < len(pattern) and pattern[pos] == "|":
-        branch_required, branch_spelled, pos = _sequence(pattern, pos + 1)
-        required = required and branch_required
+        required, branch_spelled, pos = _sequence(pattern, pos + 1)
+        branches.append(required)
         spelled = _union(spelled, branch_spelled)
-    return required, spelled, pos
+    return _required_by_all(branches), spelled, pos
 
 
-def _sequence(pattern: str, pos: int) -> tuple[bool, _Letters, int]:
+def _required_by_all(branches: list[_Required]) -> _Required:
+    """Return a set of letters, as small as a simple search finds, that has
+    one of the sets of each of *branches*."""
+    if not all(branches):
+        return ()
+    chosen: set[str] = set()
+    pending = branches
+    while pending:
+        counts: dict[frozenset[str], int] = {}
+        for branch in pending:
+            for required in set(branch):
+                counts[required] = counts.get(required, 0) + 1
+        best = min(
+            counts,
+            key=lambda required: (
+                len(required - chosen) / counts[required],
+                sorted(required),
+            ),
+        )
+        chosen |= best
+        pending = [
+            branch
+            for branch in pending
+            if not any(required <= chosen for required in branch)
+        ]
+    return (frozenset(chosen),)
+
+
+def _sequence(pattern: str, pos: int) -> tuple[_Required, _Letters, int]:
     """Read items from *pos* up to ``|``, a closing parenthesis or the end of
-    *pattern*. One that is not optional must require a letter for a match to
-    have one."""
-    required = False
+    *pattern*. A match has the letters that the items that are not optional
+    require."""
+    required: list[frozenset[str]] = []
     spelled: _Letters = _NOTHING
     while pos < len(pattern) and pattern[pos] not in "|)":
         item_required, item_spelled, pos = _item(pattern, pos)
@@ -137,26 +205,26 @@ def _sequence(pattern: str, pos: int) -> tuple[bool, _Letters, int]:
             if pos < len(pattern) and pattern[pos] in "?+":  # lazy, possessive
                 pos += 1
             if quantifier[0] != "+" and not int(quantifier[1] or 0):
-                item_required = False
-        required = required or item_required
+                item_required = ()
+        required.extend(r for r in item_required if r not in required)
         spelled = _union(spelled, item_spelled)
-    return required, spelled, pos
+    return tuple(required[:_MAX_REQUIRED]), spelled, pos
 
 
-def _item(pattern: str, pos: int) -> tuple[bool, _Letters, int]:
+def _item(pattern: str, pos: int) -> tuple[_Required, _Letters, int]:
     character = pattern[pos]
     if character == "(":
         return _group(pattern, pos)
     if character == "[":
         return _set(pattern, pos)
     if character == ".":
-        return False, None, pos + 1
+        return (), None, pos + 1
     if character == "\\":
         character = pattern[pos + 1]
         if character in _LETTERLESS_ESCAPES:
-            return False, _NOTHING, pos + 2
+            return (), _NOTHING, pos + 2
         if character in _LETTER_ESCAPES:
-            return False, None, pos + 2
+            return (), None, pos + 2
         if character.isalnum() or character == "_":
             raise _UnknownSyntaxError  # a named character, a property, etc.
         pos += 1
@@ -165,11 +233,12 @@ def _item(pattern: str, pos: int) -> tuple[bool, _Letters, int]:
         # a fuzzy matching constraint.
         raise _UnknownSyntaxError
     if character.isalpha():
-        return True, frozenset(character), pos + 1
-    return False, _NOTHING, pos + 1
+        letter = frozenset(character)
+        return (letter,), letter, pos + 1
+    return (), _NOTHING, pos + 1
 
 
-def _group(pattern: str, pos: int) -> tuple[bool, _Letters, int]:
+def _group(pattern: str, pos: int) -> tuple[_Required, _Letters, int]:
     zero_width = False
     if pattern.startswith(_LOOKAROUNDS, pos):
         zero_width = True
@@ -187,11 +256,11 @@ def _group(pattern: str, pos: int) -> tuple[bool, _Letters, int]:
         raise _UnknownSyntaxError
     if zero_width:
         # What it matches is not part of the match.
-        return False, _NOTHING, pos + 1
+        return (), _NOTHING, pos + 1
     return required, spelled, pos + 1
 
 
-def _set(pattern: str, pos: int) -> tuple[bool, _Letters, int]:
+def _set(pattern: str, pos: int) -> tuple[_Required, _Letters, int]:
     pos += 1
     any_letter = pattern[pos] == "^"
     if any_letter:
@@ -224,4 +293,4 @@ def _set(pattern: str, pos: int) -> tuple[bool, _Letters, int]:
         if character.isalpha():
             spelled.add(character)
         pos += 1
-    return False, None if any_letter else frozenset(spelled), pos + 1
+    return (), None if any_letter else frozenset(spelled), pos + 1

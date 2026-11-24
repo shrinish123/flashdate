@@ -1,6 +1,7 @@
 import copy
 import threading
 import unicodedata
+from bisect import bisect_right
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from functools import cached_property
 from itertools import chain, islice, product
@@ -17,9 +18,10 @@ from flashdate.utils import combine_dicts, normalize_unicode
 from flashdate.utils.letters import (
     case_variants,
     is_letter_free,
+    letter_key,
     letters,
     matched_letters,
-    requires_letter,
+    required_letters,
 )
 
 from .dictionary import (
@@ -69,6 +71,12 @@ def _parse_bool(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("true", "1", "yes")
     return False
+
+
+def _required_letters(pattern: re.Pattern[str]) -> tuple[frozenset[str], ...]:
+    if pattern.flags & re.VERBOSE:
+        return ()
+    return required_letters(pattern.pattern)
 
 
 def _compile_simplification(pattern: str, no_word_spacing: bool) -> re.Pattern[str]:
@@ -368,12 +376,16 @@ class Locale:
             for token in date_string_tokens
         )
 
-        # Most tokens are numbers and separators, which relative translations
-        # cannot match if all of them require a letter.
-        relative_requires_letter = self._all_require_letter(relative_translations)
+        # Most tokens are numbers, separators and words without the letters
+        # that every relative translation requires.
+        relative_required = self._required_by_any(relative_translations)
         for i, token in enumerate(date_string_tokens):
             word = token.lower()
-            if not (relative_requires_letter and is_letter_free(word)):
+            if not relative_required or not (
+                any(required.isdisjoint(word) for required in relative_required)
+                if word.isascii()
+                else is_letter_free(word)
+            ):
                 translated = False
                 for pattern, replacement in relative_translations.items():
                     if pattern.match(word):
@@ -1101,15 +1113,28 @@ class Locale:
         simplifications: Sequence[Mapping[re.Pattern[str], str]],
     ) -> str:
         start = 0
-        if is_letter_free(date_string):
-            # Only the simplifications that do not require a letter can apply,
-            # until one of them adds letters.
-            for index in self._simplifications_for_letter_free(simplifications):
+        if date_string == date_string.lower():
+            # A simplification that requires letters that the date string
+            # lacks leaves it as it is, lowercase.
+            key = letter_key(date_string)
+            candidates = self._simplifications_for(simplifications, key)
+            position = 0
+            while position < len(candidates):
+                index = candidates[position]
+                position += 1
                 pattern, replacement = next(iter(simplifications[index].items()))
-                date_string = pattern.sub(replacement, date_string).lower()
-                if not is_letter_free(date_string):
+                simplified = pattern.sub(replacement, date_string).lower()
+                if simplified == date_string:
+                    continue
+                date_string = simplified
+                if date_string != date_string.lower():
                     start = index + 1
                     break
+                new_key = letter_key(date_string)
+                if new_key != key:
+                    key = new_key
+                    candidates = self._simplifications_for(simplifications, key)
+                    position = bisect_right(candidates, index)
             else:
                 return date_string
         for simplification in islice(simplifications, start, None):
@@ -1117,31 +1142,50 @@ class Locale:
             date_string = pattern.sub(replacement, date_string).lower()
         return date_string
 
-    def _simplifications_for_letter_free(
-        self, simplifications: Sequence[Mapping[re.Pattern[str], str]]
+    def _simplifications_for(
+        self,
+        simplifications: Sequence[Mapping[re.Pattern[str], str]],
+        key: frozenset[str],
     ) -> tuple[int, ...]:
         """Return the indexes of the *simplifications* that may apply to a
-        string for which :func:`is_letter_free` is true."""
+        string with *key* as its :func:`letter_key`."""
         known = self._letter_requirements.get(id(simplifications))
         if known is None or known[0] is not simplifications:
+            requirements = tuple(
+                _required_letters(next(iter(simplification)))
+                for simplification in simplifications
+            )
+            known = self._remember_letter_requirement(
+                simplifications, (requirements, {})
+            )
+        requirements, by_key = known[1]
+        indexes: tuple[int, ...] | None = by_key.get(key)
+        if indexes is None:
             indexes = tuple(
                 index
-                for index, simplification in enumerate(simplifications)
-                if not all(requires_letter(p.pattern) for p in simplification)
+                for index, required in enumerate(requirements)
+                if not any(letters.isdisjoint(key) for letters in required)
             )
-            known = self._remember_letter_requirement(simplifications, indexes)
-        result: tuple[int, ...] = known[1]
-        return result
+            if len(by_key) >= 512:
+                by_key.clear()
+            by_key[key] = indexes
+        return indexes
 
-    def _all_require_letter(self, patterns: Iterable[re.Pattern[str]]) -> bool:
-        """Return whether none of *patterns* can match a string for which
-        :func:`is_letter_free` is true."""
+    def _required_by_any(
+        self, patterns: Iterable[re.Pattern[str]]
+    ) -> tuple[frozenset[str], ...]:
+        """Return sets of letters such that a string can only match one of
+        *patterns* if it has a letter of each set (see
+        :func:`required_letters`)."""
         known = self._letter_requirements.get(id(patterns))
         if known is None or known[0] is not patterns:
-            known = self._remember_letter_requirement(
-                patterns, all(requires_letter(p.pattern) for p in patterns)
-            )
-        result: bool = known[1]
+            required: tuple[frozenset[str], ...] = ()
+            if not any(pattern.flags & re.VERBOSE for pattern in patterns):
+                required = required_letters(
+                    "|".join(f"(?:{pattern.pattern})" for pattern in patterns)
+                )
+            known = self._remember_letter_requirement(patterns, required)
+        result: tuple[frozenset[str], ...] = known[1]
         return result
 
     def _remember_letter_requirement(

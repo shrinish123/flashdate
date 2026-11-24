@@ -9,7 +9,12 @@ import regex as re
 
 from flashdate.timezone_parser import _prefix_tree_pattern, is_timezone_token
 from flashdate.utils import normalize_unicode
-from flashdate.utils.letters import case_variants, is_letter_free, requires_letter
+from flashdate.utils.letters import (
+    case_variants,
+    is_letter_free,
+    letter_key,
+    required_letters,
+)
 
 if TYPE_CHECKING:
     from flashdate.conf import Settings
@@ -18,6 +23,18 @@ _T = TypeVar("_T")
 _CacheKey = tuple[Any, ...]
 
 _SPLIT_FLAGS = re.UNICODE | re.IGNORECASE | re.DOTALL
+
+
+def _required_letters(pattern: re.Pattern[str]) -> tuple[frozenset[str], ...]:
+    if pattern.flags & re.VERBOSE:
+        return ()
+    return required_letters(pattern.pattern)
+
+
+def _lacks_required_letters(pattern: re.Pattern[str], key: frozenset[str]) -> bool:
+    """Return whether *pattern* cannot match in a string with *key* as its
+    :func:`~flashdate.utils.letters.letter_key`."""
+    return any(letters.isdisjoint(key) for letters in _required_letters(pattern))
 
 
 def _known_words_pattern(words: list[str]) -> str:
@@ -339,20 +356,23 @@ class Dictionary:
         split_relative_regex = self._get_split_relative_regex_cache()
         match_relative_regex = self._get_match_relative_regex_cache()
 
-        # Relative strings, e.g. "\d+ days ago", do not match text without
-        # letters if they all require one.
-        letter_free = is_letter_free(string)
+        # Relative strings, e.g. "N days ago", do not match text without the
+        # letters that all of them require.
+        key = letter_key(string)
         tokens: list[Any]
-        if letter_free and requires_letter(split_relative_regex.pattern):
+        if _lacks_required_letters(split_relative_regex, key):
             tokens = [string]
         else:
             tokens = split_relative_regex.split(string)
-        match_requires_letter = requires_letter(match_relative_regex.pattern)
+        match_required = _required_letters(match_relative_regex)
+        may_match = not any(letters.isdisjoint(key) for letters in match_required)
 
         for i, token in enumerate(tokens):
-            if not (
-                match_requires_letter and (letter_free or is_letter_free(token))
-            ) and match_relative_regex.match(token):
+            if (
+                may_match
+                and not (match_required and is_letter_free(token))
+                and match_relative_regex.match(token)
+            ):
                 tokens[i] = [token]
                 continue
             tokens[i] = self._split_by_known_words(token, keep_formatting)
