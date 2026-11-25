@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, TypeGuard, TypeVar
 import regex as re
 from dateutil.relativedelta import relativedelta
 
+from flashdate._month_words import MONTH_WORDS
 from flashdate._parts_of_day import PartOfDay, _replace_part_of_day
 from flashdate.conf import Settings, apply_settings, check_settings
 from flashdate.conf import settings as _default_settings
@@ -610,6 +611,21 @@ _RELATIVE = stdlib_re.compile(
     stdlib_re.IGNORECASE | stdlib_re.ASCII,
 )
 _VALID_PERIODS = frozenset({"time", "day", "week", "month", "year"})
+# E.g. "5 janvier 2020", "5 de marzo de 2019", "5. März 2020" or
+# "5 ноября 2023 г.": dates with the name of the month in another language,
+# for the spellings and phrasings of MONTH_WORDS, when no languages are given.
+_FOREIGN = stdlib_re.compile(
+    r"(le )?([0-9]{1,2})(\.)? (de )?([^\W\d_]+) (de )?([1-9][0-9]{3})( г\.)?"
+)
+# By whether there is "le", a dot after the day, "de" before the month, "de"
+# before the year, and " г." after the year.
+_PHRASINGS = {
+    (False, False, False, False, False): "plain",
+    (False, True, False, False, False): "dot",
+    (True, False, False, False, False): "le",
+    (False, False, True, True, False): "de",
+    (False, False, False, False, True): "g",
+}
 _SHORTCUT = True
 _DEFAULT_SETTINGS_VALUES = copy.deepcopy(vars(_default_settings))
 # The settings that may differ from their default values: time zones are
@@ -731,6 +747,29 @@ def _text_parts(
     return int(year), ((_MONTH_NUMBERS[month.lower()], int(day)),), time
 
 
+def _foreign_parts(
+    match: "stdlib_re.Match[str]",
+) -> tuple[int, tuple[tuple[int, int], ...], str] | None:
+    """Return the year, the month and day, and the locale of a date string
+    that :data:`_FOREIGN` matches, or ``None`` if its month name and phrasing
+    are not among those that are read by a simple rule."""
+    le, day, dot, de_month, word, de_year, year, g = match.groups()
+    phrasing = _PHRASINGS.get(
+        (
+            le is not None,
+            dot is not None,
+            de_month is not None,
+            de_year is not None,
+            g is not None,
+        )
+    )
+    known = MONTH_WORDS.get(word.lower())
+    if phrasing is None or known is None or phrasing not in known:
+        return None
+    locale, month = known[phrasing]
+    return int(year), ((month, int(day)),), locale
+
+
 def _read_directly(
     match: "stdlib_re.Match[str]",
     tz: tuple[str, timedelta] | None,
@@ -744,10 +783,17 @@ def _read_directly(
             # The parsers read a day of the month along with the current
             # year, which they cannot do if it has less than four digits.
             return None
+        locale = "en"
         if match.re is _NUMERIC:
             year, months_and_days, time = _numeric_parts(match, settings)
-        else:
+        elif match.re is _TEXT:
             year, months_and_days, time = _text_parts(match)
+        else:
+            foreign = _foreign_parts(match)
+            if foreign is None:
+                return None
+            year, months_and_days, locale = foreign
+            time = None
         date_obj = None
         for month, day in months_and_days:
             try:
@@ -767,7 +813,7 @@ def _read_directly(
     return DateData(
         date_obj=date_obj,
         period="day",
-        locale="en",
+        locale=locale,
         parts=_DATE_PARTS if time is None else _DATE_TIME_PARTS,
     )
 
@@ -1317,6 +1363,8 @@ class DateDataParser:
                 _NUMERIC.fullmatch(date_string)
                 or _TEXT.fullmatch(date_string)
                 or _RELATIVE.fullmatch(date_string)
+                or (not self.languages and _FOREIGN.fullmatch(date_string))
+                or None
             )
         if match is None or not self._reads_directly():
             return self._get_date_data(date_string, date_formats)
@@ -1324,7 +1372,7 @@ class DateDataParser:
             return _read_relative(match, self._settings) or self._get_date_data(
                 date_string, date_formats
             )
-        suffix = match.group(match.re.groups)
+        suffix = None if match.re is _FOREIGN else match.group(match.re.groups)
         tz: tuple[str, timedelta] | None = None
         if suffix == "Z":
             tz = ("Z", timedelta(0))

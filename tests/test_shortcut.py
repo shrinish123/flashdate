@@ -389,3 +389,88 @@ def test_shortcut_reads_relative_dates(monkeypatch: pytest.MonkeyPatch) -> None:
     now = _FixedDatetime.now().replace(tzinfo=None)
     assert flashdate.parse("3 days ago") == now - timedelta(days=3)
     assert flashdate.parse("in 2 hours") == now + timedelta(hours=2)
+
+
+FOREIGN_STRINGS = [
+    "5 janvier 2020",
+    "le 5 janvier 2020",
+    "5 JANVIER 2020",
+    "1 août 1999",
+    "1 aout 1999",
+    "10 de marzo de 2019",
+    "10 marzo 2019",
+    "5. März 2020",
+    "5 marz 2020",
+    "3 de março de 2021",
+    "5 ноября 2023",
+    "5 ноября 2023 г.",
+    "5 Ноября 2023",
+    "7 maggio 2018",
+    "7. april 2018",
+    # Not read directly.
+    "31 février 2020",
+    "5 janvier 999",
+    "5 janvier 20",
+    "le 5 de marzo 2019",
+    "5 lundi 2020",
+    "5 xyz 2020",
+    "5 janvier 2020 à 10h30",
+    "lundi 5 janvier 2020",
+    "5-janvier-2020",
+    "Le 5 janvier 2020",
+    "5 de marzo de 2019 г.",
+]
+
+
+@pytest.mark.parametrize(
+    "configuration",
+    [CONFIGURATIONS[0], CONFIGURATIONS[3], CONFIGURATIONS[7], CONFIGURATIONS[10]],
+)
+def test_shortcut_gives_the_outcome_of_the_parsers_in_other_languages(
+    monkeypatch: pytest.MonkeyPatch, configuration: dict[str, Any]
+) -> None:
+    parser = DateDataParser(**configuration)
+    assert parser._reads_directly()
+    for string in FOREIGN_STRINGS:
+        with_shortcut = _outcome(parser, string)
+        with monkeypatch.context() as context:
+            context.setattr(date, "_SHORTCUT", False)
+            assert with_shortcut == _outcome(parser, string), string
+
+
+def test_shortcut_reads_dates_in_other_languages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the parsers should not be needed")
+
+    monkeypatch.setattr(DateDataParser, "_get_date_data", fail)
+    parser = DateDataParser()
+    for string, locale, expected in (
+        ("le 5 janvier 2020", "fr", datetime(2020, 1, 5)),
+        ("10 de marzo de 2019", "es", datetime(2019, 3, 10)),
+        ("5. März 2020", "de", datetime(2020, 3, 5)),
+        ("5 ноября 2023 г.", "ru", datetime(2023, 11, 5)),
+        ("3 de março de 2021", "pt", datetime(2021, 3, 3)),
+        ("7 maggio 2018", "it", datetime(2018, 5, 7)),
+    ):
+        date_data = parser.get_date_data(string)
+        assert (date_data.date_obj, date_data.locale) == (expected, locale)
+
+
+def test_shortcut_leaves_other_languages_to_the_languages_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    original = DateDataParser._get_date_data
+
+    def record(self: DateDataParser, *args: Any, **kwargs: Any) -> Any:
+        calls.append(args)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DateDataParser, "_get_date_data", record)
+    assert (
+        DateDataParser(languages=["en"]).get_date_data("5 janvier 2020").date_obj
+        is None
+    )
+    assert calls
