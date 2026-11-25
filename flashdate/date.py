@@ -632,6 +632,20 @@ _SHORTCUT_DATE_ORDERS = {"MDY": ((0, 1), (1, 0)), "DMY": ((1, 0), (0, 1))}
 _SETTINGS_ATTRIBUTES = frozenset(
     {*_DEFAULT_SETTINGS_VALUES, "_default", "_mod_settings"}
 )
+_SETTINGS_TO_MODIFY = _SHORTCUT_SETTINGS | {"DATE_ORDER"}
+_FIXED_SETTINGS = tuple(
+    name for name in _DEFAULT_SETTINGS_VALUES if name not in _SETTINGS_TO_MODIFY
+)
+_FIXED_SETTINGS_VALUES = tuple(map(_DEFAULT_SETTINGS_VALUES.get, _FIXED_SETTINGS))
+_DEFAULT_DATE_ORDER = _DEFAULT_SETTINGS_VALUES["DATE_ORDER"]
+_MUTABLE_SETTINGS = (
+    *(
+        name
+        for name, value in _DEFAULT_SETTINGS_VALUES.items()
+        if isinstance(value, (list, dict, set))
+    ),
+    "_mod_settings",
+)
 # The name and offset of the time zone that each time zone at the end of a
 # date string, with the space before it if any, was read as when a date
 # string with it went through the parsers.
@@ -1213,32 +1227,26 @@ class DateDataParser:
         known = self._shortcut_settings
         if known is not None and known[0] == values:
             return known[1]
-        modified = set(self._settings._mod_settings)
-        # A date order that is set replaces that of the locale.
-        date_order_set = "DATE_ORDER" in modified
-        modified.discard("DATE_ORDER")
+        modified = self._settings._mod_settings
+        if "DATE_ORDER" in modified:
+            # A date order that is set replaces that of the locale.
+            date_order_allowed = values.get("DATE_ORDER") in _SHORTCUT_DATE_ORDERS
+        else:
+            date_order_allowed = values.get("DATE_ORDER") == _DEFAULT_DATE_ORDER
         allowed = (
-            values.keys() <= _SETTINGS_ATTRIBUTES
-            and all(
-                values.get(name, value) == value
-                for name, value in _DEFAULT_SETTINGS_VALUES.items()
-                if name not in _SHORTCUT_SETTINGS
-                and not (name == "DATE_ORDER" and date_order_set)
-            )
-            and (
-                not date_order_set or values.get("DATE_ORDER") in _SHORTCUT_DATE_ORDERS
-            )
-            and _SHORTCUT_SETTINGS.issuperset(modified)
+            date_order_allowed
+            and tuple(map(values.get, _FIXED_SETTINGS)) == _FIXED_SETTINGS_VALUES
+            and values.keys() <= _SETTINGS_ATTRIBUTES
+            and _SETTINGS_TO_MODIFY.issuperset(modified)
         )
         # The values that can change in place are lists and mappings of
         # values that cannot.
-        self._shortcut_settings = (
-            {
-                name: value.copy() if isinstance(value, (list, dict, set)) else value
-                for name, value in values.items()
-            },
-            allowed,
-        )
+        snapshot = dict(values)
+        for name in _MUTABLE_SETTINGS:
+            value = snapshot.get(name)
+            if isinstance(value, (list, dict, set)):
+                snapshot[name] = value.copy()
+        self._shortcut_settings = (snapshot, allowed)
         return allowed
 
     def get_date_data(  # noqa: PLR0912
