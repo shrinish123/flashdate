@@ -269,9 +269,7 @@ class TestParseFunction(BaseTestCase):
         languages: list[str] | None = None,
         locales: list[str] | None = None,
     ) -> None:
-        self.result = flashdate.parse(
-            date_string, languages=languages, locales=locales
-        )
+        self.result = flashdate.parse(date_string, languages=languages, locales=locales)
 
     def when_date_is_parsed_with_settings(
         self, date_string: str, settings: dict[str, Any] | None = None

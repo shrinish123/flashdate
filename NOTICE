@@ -1,0 +1,13 @@
+flashdate
+
+This package is a modified copy of dateparser
+(https://github.com/scrapinghub/dateparser), Copyright (c) 2014, Scrapinghub,
+taken at commit ce8c4390dad4629daa2f154e7303052f9d88daec
+(version 1.5.1 and the changes merged after it up to that commit).
+
+It is not made, endorsed or supported by Scrapinghub, Zyte or the maintainers of
+dateparser. Problems with this package should not be reported to them.
+
+The modifications make parsing faster and are meant to change no result. They
+are distributed under the same license as dateparser, the BSD 3-Clause license
+in the LICENSE file.

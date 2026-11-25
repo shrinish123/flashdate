@@ -1,0 +1,4 @@
+include LICENSE NOTICE AUTHORS.rst HISTORY.rst README.md CHANGELOG.md
+recursive-include tests *
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
