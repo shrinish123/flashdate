@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import regex as re
 
 from flashdate.timezone_parser import (
+    _prefix_tree_pattern,
     is_timezone_token,
     pop_tz_offset_from_string,
     word_is_tz,
@@ -18,10 +19,13 @@ from flashdate.utils import combine_dicts, normalize_unicode
 from flashdate.utils.letters import (
     case_variants,
     is_letter_free,
+    is_single_alternative,
     letter_key,
     letters,
     matched_letters,
+    possible_words,
     required_letters,
+    words,
 )
 
 from .dictionary import (
@@ -77,6 +81,32 @@ def _required_letters(pattern: re.Pattern[str]) -> tuple[frozenset[str], ...]:
     if pattern.flags & re.VERBOSE:
         return ()
     return required_letters(pattern.pattern)
+
+
+def _has_foreign_word(
+    prepared: str, matcher: Any, known: dict[str, bool], unbound: frozenset[str]
+) -> bool:
+    """Return whether *prepared*, a date string prepared to be simplified, has
+    a word that *matcher* does not match, given what it is *known* to give
+    for some words, and none of the *unbound* letters, with which words may
+    not stay whole."""
+    if unbound and (
+        not unbound.isdisjoint(prepared)
+        if prepared.isascii()
+        else any(not case_variants(c).isdisjoint(unbound) for c in set(prepared))
+    ):
+        return False
+    for word in words(prepared):
+        is_known = known.get(word)
+        if is_known is None:
+            if len(known) >= 4096:
+                known.clear()
+            is_known = known[word] = matcher(word) is not None
+        if not is_known:
+            # Unless a token with a line break is not kept, or lowercasing,
+            # which happens again after each simplification, changes the word.
+            return "\n" not in prepared and prepared == prepared.lower()
+    return False
 
 
 def _compile_simplification(pattern: str, no_word_spacing: bool) -> re.Pattern[str]:
@@ -192,6 +222,14 @@ class Locale:
         self._bound_dictionary: tuple[Dictionary, Any, list[str], Dictionary] | None
         self._bound_dictionary = None
         self._alphabets: dict[tuple[Any, ...], frozenset[str] | None] = {}
+        # The vocabulary of the settings that it was last worked out for,
+        # with their skip tokens and whether they normalize.
+        self._screen: (
+            tuple[Any, list[str], bool, Any, dict[str, bool], frozenset[str]] | None
+        ) = None
+        self._vocabularies: dict[
+            tuple[Any, ...], tuple[Any, dict[str, bool], frozenset[str]] | None
+        ] = {}
 
     @cached_property
     def _native(self) -> "Locale":
@@ -235,6 +273,24 @@ class Locale:
             )
 
         assert settings is not None
+        if not ignore_surrounding_text:
+            # Most locales do not have the words of a given date string, which
+            # is checked first with as little work as possible.
+            screen = self._screen
+            if (
+                screen is not None
+                and screen[0] is settings
+                and screen[1] == settings.SKIP_TOKENS
+                and screen[2] == settings.NORMALIZE
+            ):
+                prepared = date_string
+                if not prepared.isascii():
+                    prepared = self._translate_numerals(prepared)
+                    if screen[2]:
+                        prepared = normalize_unicode(prepared)
+                prepared = self._prepare_to_simplify(prepared)
+                if _has_foreign_word(prepared, screen[3], screen[4], screen[5]):
+                    return False
         dictionary = self._get_dictionary(settings)
         date_tokens = self._split_simplified(
             date_string,
@@ -482,12 +538,112 @@ class Locale:
         if settings.NORMALIZE:
             prepared = normalize_unicode(prepared)
         prepared = self._prepare_to_simplify(prepared)
-        if unless_foreign and self._has_foreign_letter(prepared, settings, dictionary):
+        if unless_foreign and (
+            self._has_foreign_word(prepared, settings, dictionary)
+            or self._has_foreign_letter(prepared, settings, dictionary)
+        ):
             return None
         simplified = self._simplify_prepared(prepared, settings)
         tokens = dictionary.split(simplified, keep_formatting)
         self._last_split = (settings, date_string, keep_formatting, tokens.copy())
         return tokens
+
+    def _has_foreign_word(
+        self, prepared: str, settings: "Settings", dictionary: "Dictionary"
+    ) -> bool:
+        """Return whether *prepared*, a date string prepared to be simplified,
+        has a word that no word or pattern of this locale has, so that the
+        token with that word cannot be valid."""
+        vocabulary = self._get_vocabulary(settings, dictionary)
+        if vocabulary is None:
+            return False
+        return _has_foreign_word(prepared, *vocabulary)
+
+    def _get_vocabulary(
+        self, settings: "Settings", dictionary: "Dictionary"
+    ) -> tuple[Any, dict[str, bool], frozenset[str]] | None:
+        """Return a function that matches the words that tokens valid for this
+        locale can have, ignoring case as its patterns do, what it is known to
+        give for some words, and the letters with which this does not hold,
+        or ``None`` if tokens can have any word."""
+        key = (bool(settings.NORMALIZE), *settings.SKIP_TOKENS)
+        vocabulary: tuple[Any, dict[str, bool], frozenset[str]] | None
+        try:
+            vocabulary = self._vocabularies[key]
+        except KeyError:
+            pass
+        except TypeError:  # unhashable skip tokens
+            return None
+        else:
+            return vocabulary
+        vocabulary = None
+        generated = self._generate_vocabulary(settings, dictionary)
+        if generated is not None:
+            spellings, unbound = generated
+            pattern = re.compile(
+                _prefix_tree_pattern(sorted(spellings)), re.IGNORECASE | re.UNICODE
+            )
+            vocabulary = (pattern.fullmatch, {}, unbound)
+        if len(self._vocabularies) >= 8:
+            self._vocabularies.clear()
+        self._vocabularies[key] = vocabulary
+        if vocabulary is not None:
+            self._screen = (
+                settings,
+                list(settings.SKIP_TOKENS),
+                bool(settings.NORMALIZE),
+                *vocabulary,
+            )
+        return vocabulary
+
+    def _generate_vocabulary(
+        self, settings: "Settings", dictionary: "Dictionary"
+    ) -> tuple[set[str], frozenset[str]] | None:
+        # Words are told apart by what is around them only where words are
+        # written with spaces between them. There, a valid token is a number,
+        # a word of the dictionary, or a match of a relative string, and a
+        # word of the date string ends up in a token unless a simplification
+        # matches it, or it is an ordinal suffix, which is dropped after a
+        # number.
+        if _parse_bool(self.info.get("no_word_spacing", False)) or (
+            dictionary._no_word_spacing
+        ):
+            return None
+        keys = list(dictionary)
+        if not all(isinstance(key, str) and key for key in keys):
+            return None
+        spellings = {"st", "nd", "rd", "th"}.union(*map(words, keys))
+        patterns = [
+            dictionary._get_split_relative_regex_cache(),
+            dictionary._get_match_relative_regex_cache(),
+        ]
+        unbound: set[str] = set()
+        for simplification in self._get_simplifications(settings=settings):
+            for pattern, replacement in simplification.items():
+                if "\n" in replacement:
+                    return None
+                if not is_single_alternative(pattern.pattern):
+                    # A simplification with alternatives, e.g. "devet|deviti",
+                    # is not held to whole words: it also matches within
+                    # "xdeviti". That takes one of the letters that it has.
+                    spelled = matched_letters(pattern.pattern)
+                    if spelled is None or not required_letters(pattern.pattern):
+                        return None
+                    unbound.update(*map(case_variants, spelled))
+                patterns.append(pattern)
+        for pattern in patterns:
+            possible = possible_words(pattern.pattern)
+            if possible is None or pattern.flags & re.VERBOSE:
+                return None
+            spellings |= possible
+        if unbound and any(
+            not unbound.isdisjoint(replacement)
+            for simplification in self._get_simplifications(settings=settings)
+            for replacement in simplification.values()
+        ):
+            # What a simplification puts in may have those letters as well.
+            return None
+        return spellings, frozenset(unbound)
 
     def _has_foreign_letter(
         self, prepared: str, settings: "Settings", dictionary: "Dictionary"
@@ -551,6 +707,9 @@ class Locale:
         return frozenset().union(*map(case_variants, spelled))
 
     def _translate_numerals(self, date_string: str) -> str:
+        if date_string.isascii():
+            # Its numerals are the ones to translate to.
+            return date_string
         date_string_tokens = NUMERAL_PATTERN.split(date_string)
         for i, token in enumerate(date_string_tokens):
             if token.isdecimal() and not token.isascii():

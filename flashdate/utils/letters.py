@@ -294,3 +294,160 @@ def _set(pattern: str, pos: int) -> tuple[_Required, _Letters, int]:
             spelled.add(character)
         pos += 1
     return (), None if any_letter else frozenset(spelled), pos + 1
+
+
+# A word: characters between the spaces, punctuation, digits and underscores
+# that words of a date string are told apart by.
+_WORD = re.compile(r"[^\W\d_]+")
+_MAX_SPELLINGS = 4096
+_Spellings = frozenset[str]
+_EMPTY: _Spellings = frozenset({""})
+
+
+@lru_cache(maxsize=512)
+def words(text: str) -> frozenset[str]:
+    """Return the words of *text*."""
+    return frozenset(_WORD.findall(text))
+
+
+@cache
+def possible_words(pattern: str) -> frozenset[str] | None:
+    r"""Return the :func:`words` that the matches of *pattern*, a regular
+    expression without the ``VERBOSE`` flag, can have, as the pattern spells
+    them out, or ``None`` if a simple reading of the pattern cannot tell, e.g.
+    because ``\w+`` matches any word.
+
+    A word of a match is one of these words, or matches one of them ignoring
+    case.
+    """
+    try:
+        spellings, end = _spellings_of_alternation(pattern, 0)
+    except (_UnknownSyntaxError, IndexError):
+        return None
+    if end != len(pattern):
+        return None
+    return frozenset().union(*map(words, spellings))
+
+
+def _spellings_of_alternation(pattern: str, pos: int) -> tuple[_Spellings, int]:
+    """Return what the alternatives from *pos* up to a closing parenthesis or
+    the end of *pattern* can match, with ``0`` for any digits and a space for
+    any other characters that are not part of words."""
+    spellings, pos = _spellings_of_sequence(pattern, pos)
+    while pos < len(pattern) and pattern[pos] == "|":
+        more, pos = _spellings_of_sequence(pattern, pos + 1)
+        spellings |= more
+        if len(spellings) > _MAX_SPELLINGS:
+            raise _UnknownSyntaxError
+    return spellings, pos
+
+
+def _spellings_of_sequence(pattern: str, pos: int) -> tuple[_Spellings, int]:
+    spellings = _EMPTY
+    while pos < len(pattern) and pattern[pos] not in "|)":
+        item, pos = _spellings_of_item(pattern, pos)
+        quantifier = _QUANTIFIER.match(pattern, pos)
+        if quantifier:
+            pos = quantifier.end()
+            if pos < len(pattern) and pattern[pos] in "?+":  # lazy, possessive
+                pos += 1
+            if quantifier[0] != "?" and any(map(_WORD.search, item)):
+                # A word repeated any number of times is any number of words.
+                raise _UnknownSyntaxError
+            if quantifier[0] != "+" and not int(quantifier[1] or 0):
+                item |= _EMPTY
+        if len(spellings) * len(item) > _MAX_SPELLINGS:
+            raise _UnknownSyntaxError
+        spellings = frozenset(start + end for start in spellings for end in item)
+    return spellings, pos
+
+
+def _spellings_of_item(pattern: str, pos: int) -> tuple[_Spellings, int]:
+    character = pattern[pos]
+    if character == "(":
+        return _spellings_of_group(pattern, pos)
+    if character == "[":
+        return _spellings_of_set(pattern, pos)
+    if character in "^$":
+        return _EMPTY, pos + 1
+    if character == "\\":
+        character = pattern[pos + 1]
+        if character == "d":
+            return frozenset("0"), pos + 2
+        if character in "sW":
+            return frozenset(" "), pos + 2
+        if character in "bBAZzG":
+            return _EMPTY, pos + 2
+        if character.isalnum() or character == "_":
+            # A class that letters belong to, a group reference, etc.
+            raise _UnknownSyntaxError
+        pos += 1
+    elif character in "?*+{}.":
+        raise _UnknownSyntaxError
+    return frozenset(character), pos + 1
+
+
+def _spellings_of_group(pattern: str, pos: int) -> tuple[_Spellings, int]:
+    zero_width = False
+    if pattern.startswith(_LOOKAROUNDS, pos):
+        zero_width = True
+        pos += 4 if pattern[pos + 2] == "<" else 3
+    elif pattern.startswith("(?:", pos):
+        pos += 3
+    elif pattern.startswith("(?P<", pos):
+        pos = pattern.index(">", pos) + 1
+    elif pattern.startswith("(?", pos):
+        raise _UnknownSyntaxError
+    else:
+        pos += 1
+    if zero_width:
+        # What it matches is not part of the match. It only has to be read.
+        _, _, pos = _alternation(pattern, pos)
+        spellings = _EMPTY
+    else:
+        spellings, pos = _spellings_of_alternation(pattern, pos)
+    if pattern[pos] != ")":
+        raise _UnknownSyntaxError
+    return spellings, pos + 1
+
+
+def _spellings_of_set(pattern: str, pos: int) -> tuple[_Spellings, int]:
+    pos += 1
+    if pattern[pos] == "^":
+        raise _UnknownSyntaxError  # matches most letters
+    spellings = set()
+    first = True
+    while first or pattern[pos] != "]":
+        first = False
+        character = pattern[pos]
+        if character == "[":
+            raise _UnknownSyntaxError
+        if character == "\\":
+            pos += 1
+            character = pattern[pos]
+            if character == "d":
+                character = "0"
+            elif character in "sW":
+                character = " "
+            elif character.isalnum() or character == "_":
+                raise _UnknownSyntaxError
+        elif pattern[pos + 1] == "-" and pattern[pos + 2] != "]":
+            end = pattern[pos + 2]
+            if not (character.isdigit() and end.isdigit()):
+                raise _UnknownSyntaxError  # may be a range with letters
+            pos += 2
+            character = "0"
+        spellings.add(character)
+        pos += 1
+    return frozenset(spellings), pos + 1
+
+
+def is_single_alternative(pattern: str) -> bool:
+    """Return whether *pattern*, a regular expression without the ``VERBOSE``
+    flag, is known to have no alternatives at its top level, so that what is
+    at its start and at its end applies to all its matches."""
+    try:
+        _, _, end = _sequence(pattern, 0)
+    except (_UnknownSyntaxError, IndexError):
+        return False
+    return end == len(pattern)

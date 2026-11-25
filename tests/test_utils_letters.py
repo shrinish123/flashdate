@@ -3,13 +3,17 @@ import regex as re
 
 from flashdate.conf import settings
 from flashdate.languages.loader import default_loader
+from flashdate.utils import normalize_unicode
 from flashdate.utils.letters import (
     case_variants,
     is_letter_free,
+    is_single_alternative,
     letter_key,
     matched_letters,
+    possible_words,
     required_letters,
     requires_letter,
+    words,
 )
 
 
@@ -166,3 +170,103 @@ def test_patterns_do_not_match_text_without_their_required_letters(
         for text in texts:
             if any(letters.isdisjoint(letter_key(text)) for letters in required):
                 assert not pattern.search(text), (pattern.pattern, text)
+
+
+def test_words() -> None:
+    # Digits and underscores tell words apart, like spaces and punctuation.
+    assert words("5pm 3rd_of März, 2020 at10") == {"pm", "rd", "of", "März", "at"}
+    assert words("2023-11-05 12:30") == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("pattern", "expected"),
+    [
+        (r"\d++[.,]?\d*+ days? ago", "day days ago"),
+        (r"in \d+ weeks' time", "in weeks time"),
+        (r"(?<=\A|\W|_)(?:12\s+)?noon(?=\Z|\W|_)", "noon"),
+        (r"a\.m\.?", "a m"),
+        (r"(\d+)h(\d+)", "h"),
+        (r"x\s*y", "x y xy"),
+        (r"centur(?:y|ies)", "century centuries"),
+        (r"this ((?:early )?morning|afternoon)", "this early morning afternoon"),
+        (r"(\d+)(?:st|nd|rd|th) day", "st nd rd th day"),
+        (r"[ae]b", "ab eb"),
+        (r"年|月", "年 月"),
+    ],
+)
+def test_possible_words(pattern: str, expected: str) -> None:
+    assert possible_words(pattern) == frozenset(expected.split())
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"\w+",
+        r"a.",
+        r"[a-z]",
+        r"[^a]",
+        r"(?:ha)+",
+        r"x*y",
+        r"a{2}",
+        r"\S",
+        r"(a)\1",
+        r"(?i)a",
+        r"\p{L}",
+        r"[!-~]",
+        r"(a",
+        r"a)",
+    ],
+)
+def test_patterns_that_may_match_any_word(pattern: str) -> None:
+    assert possible_words(pattern) is None
+
+
+def test_is_single_alternative() -> None:
+    assert is_single_alternative(r"(?<=\A|\W|_)dopoledne(?=\Z|\W|_)")
+    assert is_single_alternative(r"(?<=\A|\W|_)(?:a|b)c(?=\Z|\W|_)")
+    # Only the first alternative has to start at the start of a word.
+    assert not is_single_alternative(r"(?<=\A|\W|_)devet|deviti(?=\Z|\W|_)")
+    assert not is_single_alternative(r"(a")
+
+
+@pytest.mark.parametrize(
+    "language", ["en", "fr", "de", "es", "it", "pt", "nl", "pl", "ru", "cs", "tr", "fi"]
+)
+def test_locale_is_not_applicable_to_text_with_a_foreign_word(language: str) -> None:
+    locale = default_loader.get_locale(language)
+    dictionary = locale._get_dictionary(settings)
+    texts = [
+        "5 march 2023",
+        "3 days ago",
+        "le 5 janvier 2020 à 10h30",
+        "vor 3 tagen",
+        "hace 3 días",
+        "5 ноября 2023 г.",
+        "dopoledne 472 xdeviti",
+        "восемь дней назад",
+        "2 settimane fa",
+        "out of stock",
+        "5pm",
+        "3rd",
+        "1h30",
+        "xmay 5",
+        "may5",
+        "5may",
+        "may_5",
+        "dayſ ago",
+        "n/a",
+        "12:30",
+    ]
+    for text in texts:
+        prepared = locale._prepare_to_simplify(
+            normalize_unicode(locale._translate_numerals(text))
+        )
+        foreign = locale._has_foreign_word(prepared, settings, dictionary)
+        locale._last_split = None
+        applicable = locale.is_applicable(text, settings=settings)
+        locale._last_split = None
+        tokens = locale._split_simplified(text, settings, dictionary)
+        assert tokens is not None
+        assert applicable == dictionary.are_tokens_valid(tokens), (language, text)
+        if foreign:
+            assert not applicable, (language, text)
