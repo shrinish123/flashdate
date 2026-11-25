@@ -37,6 +37,7 @@ from flashdate.utils import (
     set_correct_day_from_settings,
     set_correct_month_from_settings,
 )
+from flashdate.utils.strptime import reads_am_pm
 from flashdate.utils.strptime import strptime as patched_strptime
 
 if TYPE_CHECKING:
@@ -740,7 +741,9 @@ def _text_parts(
     if hour is not None:
         hours = int(hour)
         if meridian:
-            if not 1 <= hours <= 12:
+            if not 1 <= hours <= 12 or not reads_am_pm():
+                # In a process whose locale has other names for AM and PM,
+                # they are not read.
                 raise ValueError(hour)
             hours = hours % 12 + (12 if meridian.lower() == "pm" else 0)
         time = (hours, int(minute), int(second) if second else 0, 0)

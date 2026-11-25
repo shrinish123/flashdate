@@ -1,5 +1,5 @@
 from operator import attrgetter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import regex as re
 from parameterized import param, parameterized
@@ -465,6 +465,71 @@ class TestLocaleDataLoader(BaseTestCase):
         self.assertEqual(shortnames[0], "en")
         self.assertIn("es-MX", shortnames)
         self.assertNotIn("es", shortnames)
+
+    def shortnames(self, **kwargs: Any) -> list[str]:
+        return [locale.shortname for locale in self.data_loader.get_locales(**kwargs)]
+
+    @parameterized.expand(
+        [
+            param(languages=["fr", "en", "es"]),
+            param(languages=("fr", "en", "es")),
+            param(languages=["fr", "en", "es"], use_given_order=True),
+            param(languages=["en", "es"], region="MX"),
+            param(locales=["fr-BE", "en-CC"], use_given_order=True),
+            param(languages=["es"], locales=["fr-BE", "en-CC"]),
+            param(
+                locales=["en-CC", "en-VG"],
+                use_given_order=True,
+                allow_conflicting_locales=True,
+            ),
+            param(region="MX"),
+            param(),
+        ]
+    )
+    def test_same_arguments_give_the_same_locales_again(self, **kwargs: Any) -> None:
+        first = self.shortnames(**kwargs)
+        self.assertTrue(first)
+        self.assertEqual(self.shortnames(**kwargs), first)
+        # Also after the locales are loaded anew.
+        self.data_loader._loaded_languages.clear()
+        self.data_loader._loaded_locales.clear()
+        self.assertEqual(self.shortnames(**kwargs), first)
+
+    def test_arguments_are_told_apart(self) -> None:
+        self.assertEqual(self.shortnames(languages=["fr", "en"]), ["en", "fr"])
+        self.assertEqual(
+            self.shortnames(languages=["fr", "en"], use_given_order=True), ["fr", "en"]
+        )
+        self.assertEqual(self.shortnames(languages=["fr"]), ["fr"])
+        self.assertEqual(self.shortnames(locales=["fr"]), ["fr"])
+        self.assertEqual(self.shortnames(languages=["fr"], region="BE"), ["fr-BE"])
+        self.assertEqual(self.shortnames(languages=["fr", "en"]), ["en", "fr"])
+
+    def test_changed_list_of_languages_is_read_again(self) -> None:
+        languages = ["fr", "en"]
+        self.assertEqual(self.shortnames(languages=languages), ["en", "fr"])
+        languages.append("es")
+        self.assertEqual(self.shortnames(languages=languages), ["en", "es", "fr"])
+        languages.remove("en")
+        self.assertEqual(self.shortnames(languages=languages), ["es", "fr"])
+
+    def test_languages_in_other_collections(self) -> None:
+        for languages in ({"fr", "en"}, {"fr": 1, "en": 2}, frozenset({"fr", "en"})):
+            for _ in range(2):
+                self.assertEqual(self.shortnames(languages=languages), ["en", "fr"])
+
+    def test_error_raised_for_unknown_languages_every_time(self) -> None:
+        for _ in range(2):
+            with self.assertRaisesRegex(ValueError, "Unknown language"):
+                self.shortnames(languages=["en", "unknown"])
+
+    def test_resolved_locales_are_bounded(self) -> None:
+        languages = self.shortnames()
+        for first in languages[:20]:
+            for second in languages[:20]:
+                self.shortnames(languages=[first, second], use_given_order=True)
+        self.assertLessEqual(len(self.data_loader._resolved_locales), 256)
+        self.assertEqual(self.shortnames(languages=["fr", "en"]), ["en", "fr"])
 
     def load_data(
         self,

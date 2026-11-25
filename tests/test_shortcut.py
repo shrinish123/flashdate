@@ -4,6 +4,8 @@ must give the same outcome."""
 
 import calendar
 import random
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -474,3 +476,50 @@ def test_shortcut_leaves_other_languages_to_the_languages_given(
         is None
     )
     assert calls
+
+
+_OTHER_LOCALE = """
+import locale
+import time
+
+for name in {locales!r}:
+    try:
+        locale.setlocale(locale.LC_ALL, name)
+    except locale.Error:
+        continue
+    if time.strftime("%p", (2020, 1, 1, 15, 0, 0, 2, 1, 0)).lower() != "pm":
+        break
+else:
+    raise SystemExit("no such locale")
+
+from flashdate import date
+from flashdate.date import DateDataParser
+
+for string in {strings!r}:
+    outcomes = []
+    for shortcut in (True, False):
+        date._SHORTCUT = shortcut
+        outcomes.append(DateDataParser().get_date_data(string).date_obj)
+    print(string, outcomes[0] == outcomes[1], outcomes[1] is None, sep="|")
+"""
+
+
+def test_shortcut_reads_am_and_pm_as_the_locale_of_the_process_allows() -> None:
+    """The parsers take the names of AM and PM from the locale that the
+    process has when flashdate is loaded, so in a locale with other names,
+    or without them, they do not read "PM"."""
+    strings = ["5 Mar 2023 1:30 PM", "March 5, 2023 11:05 am", "5 Mar 2023 13:30"]
+    locales = ["de_DE.UTF-8", "fr_FR.UTF-8", "ja_JP.UTF-8", "zh_CN.UTF-8"]
+    result = subprocess.run(
+        [sys.executable, "-c", _OTHER_LOCALE.format(locales=locales, strings=strings)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if "no such locale" in result.stderr:
+        pytest.skip("No locale with other names for AM and PM is installed")
+    assert result.returncode == 0, result.stderr
+    lines = [line.split("|") for line in result.stdout.splitlines()]
+    assert [line[0] for line in lines] == strings
+    assert all(line[1] == "True" for line in lines), lines
+    assert lines[-1][2] == "False", lines

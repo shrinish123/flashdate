@@ -1,6 +1,7 @@
 import calendar
 import importlib.util
 import sys
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -144,24 +145,66 @@ def strptime(
     date_string, prepared_format, day_of_year_in_format = _prepare_format(
         date_string, format, reference_year
     )
-    if "%Z" in prepared_format:
+    locale_time = _locale_time()
+    if locale_time is None or "%Z" in prepared_format:
         # The time zone names that %Z reads may change with the process time
         # zone.
         return _strptime(date_string, prepared_format, day_of_year_in_format)
-    result = _strptime_cached(date_string, prepared_format, day_of_year_in_format)
+    result = _strptime_cached(
+        date_string, prepared_format, day_of_year_in_format, locale_time
+    )
     if type(result) is tuple:
         raise ValueError(*result)
     return result  # type: ignore[return-value]
+
+
+def _locale_time() -> Any:
+    """Return the names that the standard library has read from the locale
+    and the time zone of the process to parse dates, e.g. those of AM and PM,
+    or ``None`` if they are unknown or about to be read again.
+
+    The standard library reads them when it is loaded, and again whenever the
+    time zone of the process has changed.
+    """
+    cache = __strptime.__globals__.get("_TimeRE_cache")
+    locale_time = getattr(cache, "locale_time", None)
+    if (
+        locale_time is None
+        or time.tzname != getattr(locale_time, "tzname", None)
+        or time.daylight != getattr(locale_time, "daylight", None)
+    ):
+        return None
+    return locale_time
+
+
+def reads_am_pm() -> bool:
+    """Return whether :func:`strptime` reads "AM" and "PM".
+
+    It reads the names that the locale of the process has for them, and e.g.
+    a Japanese locale has other names and a German locale has none.
+    """
+    locale_time = _locale_time()
+    return locale_time is not None and getattr(locale_time, "am_pm", None) == [
+        "am",
+        "pm",
+    ]
 
 
 # Reading a date tries the same few directives on the same few numbers and
 # names over and over, e.g. "05" as a month, as a day and as a year.
 @lru_cache(maxsize=4096)
 def _strptime_cached(
-    date_string: str, prepared_format: str, day_of_year_in_format: bool
+    date_string: str,
+    prepared_format: str,
+    day_of_year_in_format: bool,
+    locale_time: Any,
 ) -> datetime | tuple[Any, ...]:
     """Return the outcome of :func:`_strptime`: the date, or the arguments of
-    the :class:`ValueError` that it raises."""
+    the :class:`ValueError` that it raises.
+
+    The outcome also depends on *locale_time*, the result of
+    :func:`_locale_time`.
+    """
     try:
         return _strptime(date_string, prepared_format, day_of_year_in_format)
     except ValueError as error:

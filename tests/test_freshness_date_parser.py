@@ -7,10 +7,12 @@ from typing import Any
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
+import pytz
 from dateutil.relativedelta import relativedelta
 from parameterized import param, parameterized
 
 import flashdate
+import flashdate.freshness_date_parser
 from flashdate.conf import Settings, settings
 from flashdate.date import DateData, DateDataParser
 from flashdate.freshness_date_parser import PATTERN, freshness_date_parser
@@ -2819,6 +2821,69 @@ class TestFreshnessDateDataParser(BaseTestCase):
             start = monotonic()
             call(string)
             self.assertLess(monotonic() - start, 0.5, (call, string[0]))
+
+    @parameterized.expand(
+        [
+            param(""),
+            param("ago"),
+            param("in"),
+            param("hour ago"),
+            param("Out of stock"),
+            param("Out of stock EST"),
+            param("10:30"),
+            param("10:30 pm UTC"),
+            param("15 hourly"),
+        ]
+    )
+    def test_strings_without_a_quantity_are_not_relative_dates(
+        self, date_string: str
+    ) -> None:
+        flashdate.freshness_date_parser._NOW_WORKS.clear()
+        for timezone in ("local", "UTC", "Asia/Tokyo"):
+            timezone_settings = settings.replace(TIMEZONE=timezone)
+            # The second time, the current time is not worked out.
+            for _ in range(2):
+                self.assertEqual(
+                    freshness_date_parser.parse(date_string, timezone_settings),
+                    (None, None),
+                )
+
+    @parameterized.expand(
+        [
+            param("Out of stock"),
+            param("Out of stock EST"),
+            param("2 hour ago"),
+        ]
+    )
+    def test_unknown_timezone_is_reported_without_a_quantity(
+        self, date_string: str
+    ) -> None:
+        flashdate.freshness_date_parser._NOW_WORKS.clear()
+        # The current time is known to work for another time zone.
+        freshness_date_parser.parse(date_string, settings)
+        freshness_date_parser.parse(date_string, settings)
+        unknown = settings.replace(TIMEZONE="Nowhere/Nothing")
+        for _ in range(2):
+            with self.assertRaises(pytz.UnknownTimeZoneError):
+                freshness_date_parser.parse(date_string, unknown)
+        with self.assertRaises(pytz.UnknownTimeZoneError):
+            freshness_date_parser.parse(
+                date_string, unknown.replace(RELATIVE_BASE=datetime(2020, 1, 1))
+            )
+
+    def test_known_working_timezones_are_bounded(self) -> None:
+        flashdate.freshness_date_parser._NOW_WORKS.clear()
+        for timezone in pytz.common_timezones[:100]:
+            freshness_date_parser.parse(
+                "Out of stock", settings.replace(TIMEZONE=timezone)
+            )
+        self.assertLessEqual(
+            len(flashdate.freshness_date_parser._NOW_WORKS),
+            flashdate.freshness_date_parser._MAX_NOW_WORKS,
+        )
+        self.assertEqual(
+            freshness_date_parser.parse("Out of stock", settings), (None, None)
+        )
 
     def given_date_string(self, date_string: str) -> None:
         self.date_string = date_string

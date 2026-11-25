@@ -2,10 +2,11 @@ import datetime as dt
 from datetime import datetime, timedelta
 from time import process_time
 from types import ModuleType
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 from unittest import SkipTest
 from unittest.mock import Mock, patch
 
+import regex
 from parameterized import param, parameterized
 from pytz import timezone
 
@@ -13,6 +14,9 @@ import flashdate.timezone_parser
 from flashdate import parse
 from flashdate.timezone_parser import (
     StaticTzInfo,
+    _find_tz,
+    _prefix_tree_pattern,
+    _tz_regexes,
     build_tz_offsets,
     convert_to_local_tz,
     get_local_tz_offset,
@@ -20,8 +24,12 @@ from flashdate.timezone_parser import (
     pop_tz_offset_from_string,
     word_is_tz,
 )
+from flashdate.timezones import timezone_info_list
 from flashdate_scripts import tz_abbreviation_conflicts
 from tests import BaseTestCase
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 class TestTZPopping(BaseTestCase):
@@ -588,3 +596,101 @@ class TestBuildTzOffsets(BaseTestCase):
         assert offsets["CEST"]["offset"] == timedelta(hours=2)
         assert offsets["CEST"]["regex"].search(" CEST")
         assert "CEST" in parts
+
+
+def _find_tz_by_named_groups(
+    string: str,
+) -> tuple[tuple[int, int], str, timedelta] | None:
+    """Find the timezone that :func:`_find_tz` must find: the earliest one of
+    the first family whose pattern matches, which is that of the named group
+    of the match."""
+    for pattern, timezones in _tz_regexes().families:
+        if pattern.flags & regex.REVERSE:
+            last = pattern.search(string)
+            matches = [last] if last else []
+        else:
+            matches = list(pattern.finditer(string, overlapped=True))
+        found = [
+            (
+                int(next(k for k, v in match.groupdict().items() if v is not None)[2:]),
+                match.span(),
+            )
+            for match in matches
+        ]
+        if found:
+            index, span = min(found, key=lambda item: item[0])
+            name, offset = timezones[index]
+            return span, name, offset
+    return None
+
+
+def _strings_with_timezones() -> "Iterator[str]":
+    names = [
+        name
+        for tz_info in timezone_info_list
+        for name, _ in tz_info["timezones"]
+        if name.isalpha()
+    ]
+    for name in names:
+        yield f"10:00 {name}"
+        yield f"10:00 {name.lower()}"
+        yield f"10:00 ({name.capitalize()})"
+        yield f"10:00{name}"
+        yield f"{name} 10:00"
+        yield f"10:00 {name}x"
+        yield f"10:00 {name}5"
+        # Letters that only match when case is ignored: "ſ" and the Kelvin sign.
+        yield "10:00 " + name.replace("S", "ſ").replace("K", "\u212a")
+    for first, second in zip(names, names[7:], strict=False):
+        yield f"10:00 {first}/{second}"
+        yield f"{first} 10:00 {second}"
+    for sign in "+-":
+        for hours in range(15):
+            for minutes in ("00", "30", "45"):
+                for offset in (
+                    f"UTC{sign}{hours:02d}:{minutes}",
+                    f"GMT{sign}{hours:02d}{minutes}",
+                    f"UTC{sign}{hours}:{minutes}",
+                    f"GMT{sign}{hours}",
+                    f"{sign}{hours:02d}:{minutes}",
+                    f"{sign}{hours:02d}{minutes}",
+                    f"{sign}{hours:02d}",
+                ):
+                    yield f"10:00 {offset}"
+                    yield f"10:00{offset}"
+                    yield f"10:00 {offset} EST"
+                    yield f"10:00 EST {offset}"
+    yield from ("", " ", "15 May 2004", "10:00", "2015-06-01", "1 hour ago")
+
+
+class TestFindTz(BaseTestCase):
+    def test_finds_the_timezone_of_the_named_group_that_matches(self) -> None:
+        strings = list(_strings_with_timezones())
+        found = 0
+        for string in strings:
+            expected = _find_tz_by_named_groups(string)
+            self.assertEqual(_find_tz(string), expected, string)
+            found += expected is not None
+        # Most strings have a timezone, so the comparison is not of misses.
+        self.assertGreater(found, len(strings) // 2)
+
+    @parameterized.expand(
+        [
+            param(words=["EST", "EDT", "E", "ESTX", "CET"]),
+            param(words=["A"]),
+            param(words=["AB", "A", "ABC", "B"]),
+            param(words=["MSK", "MSD", "MST", "MDT"]),
+        ]
+    )
+    def test_prefix_tree_matches_the_words_only(self, words: list[str]) -> None:
+        pattern = regex.compile(_prefix_tree_pattern(words))
+        candidates = set(words) | {""}
+        for word in words:
+            candidates.update(word[:end] for end in range(len(word)))
+            candidates.update((word + "X", "X" + word, word.lower()))
+        for candidate in candidates:
+            self.assertEqual(
+                pattern.fullmatch(candidate) is not None,
+                candidate in words,
+                candidate,
+            )
