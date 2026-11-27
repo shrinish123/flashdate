@@ -20,3 +20,18 @@ The table in the main README comes from the Benchmark workflow of this
 repository, which runs `python bench/bench.py --markdown` on GitHub's standard
 Ubuntu runners, three times on three machines, and writes each table to the
 summary of the run. Start it from the Actions tab of a fork to repeat it.
+
+## Memory
+
+`memory.py` measures the memory of both libraries in the same environment:
+
+```
+python bench/memory.py
+```
+
+Each case runs in a new process for each library. It prints the peak memory of
+the process, and the memory of the Python objects that are alive when the last
+string has been parsed, which is what the library holds on to. The last case
+parses dates with the month names of every language, so that every language
+gets loaded: that is where flashdate holds more than dateparser. The Benchmark
+workflow runs it too.
