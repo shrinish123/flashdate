@@ -66,7 +66,50 @@ are also faster: 2 to 5 times for most of them. Among those are two-digit
 years, hyphenated dates like `5-Mar-2024`, dates with a time or a weekday in
 languages other than English, and free-form phrases.
 
-To measure it on your machine, see [bench/](bench/README.md).
+## How much memory
+
+Megabytes, with CPython 3.12 on a standard GitHub Actions runner (Ubuntu), from
+[a run of the same workflow](https://github.com/shrinish123/flashdate/actions/runs/46047441653).
+Each case is parsed in a new process. Peak is the most memory the process held
+at any moment; Python alone peaks at 16.7. Kept is the memory of the Python
+objects alive after the last string, which is what the library holds on to.
+
+| Parsed in a new process | Peak, dateparser | Peak, flashdate | Kept, dateparser | Kept, flashdate |
+| --- | ---: | ---: | ---: | ---: |
+| Only the import | 28.5 | 27.3 | 5.5 | 5.8 |
+| One ISO date | 32.8 | 30.0 | 8.0 | 6.0 |
+| 10,000 ISO and numeric dates | 33.6 | 34.1 | 8.1 | 8.7 |
+| 10,000 dates with English month names | 33.5 | 34.4 | 8.1 | 8.7 |
+| 10,000 dates in French, Spanish and Russian | 35.7 | 32.7 | 9.8 | 6.0 |
+| 10,000 relative dates | 33.5 | 32.7 | 8.0 | 7.2 |
+| 1,000 texts that are not dates | 67.2 | 66.8 | 41.4 | 41.2 |
+| 10,000 strings of every kind above | 68.9 | 68.4 | 42.4 | 41.9 |
+| 50,000 strings of every kind above | 72.1 | 71.2 | 42.4 | 41.9 |
+| 10,000 dates in the 205 languages | 81.7 | 96.0 | 54.6 | 67.6 |
+
+In every case but the last, flashdate uses the memory of dateparser to within
+1 MB, or less, and neither library grows with the number of strings. The jump
+to about 40 MB kept is dateparser's own: a string that no language reads makes
+both libraries load every language.
+
+The last case is where flashdate costs memory. When dates in every language go
+through one process, flashdate keeps 13 MB more than dateparser, about a
+quarter more. It is a fixed amount, which does not grow with the number of
+strings. On 20,000 real article dates in many languages, measured on a laptop,
+the difference was 13.5 MB, and this is where it sits:
+
+| What flashdate holds that dateparser does not | About |
+| --- | ---: |
+| One compiled pattern per language, used to skip a language by its words | 5.5 MB |
+| Results of analysing each pattern (which letters and words it needs) | 3.2 MB |
+| Memos of recently seen words, formats and time zones | 2.5 MB |
+| Word-splitting patterns in their faster form, and smaller tables | 2 MB |
+
+These are the structures that make the strings outside the fast paths 2 to 5
+times faster. The fast paths themselves cost almost no memory. Reducing this
+difference is planned for the next release.
+
+To measure speed and memory on your machine, see [bench/](bench/README.md).
 
 ## How it is the same
 

@@ -18,4 +18,8 @@ First release. Built from dateparser at `ce8c4390`: version
   17 times: time zones are searched once per string, locales are skipped by the
   letters and words of the string, and known words are matched with a prefix
   tree.
+- Memory is that of dateparser to within 1 MB, or less, except when dates in
+  every language go through one process: then flashdate keeps about 13 MB more
+  (68 MB against 55). Reducing this is planned for the next release. See "How
+  much memory" in the README.
 - Results are those of dateparser. See `verification/README.md`.
