@@ -16,5 +16,7 @@ rounds on one thread and the median round is printed. Run it on an idle machine;
 the differences between rows of the same library are small enough for a busy one
 to hide.
 
-The table in the main README comes from this script on an Apple M-series laptop
-with CPython 3.12.
+The table in the main README comes from the Benchmark workflow of this
+repository, which runs `python bench/bench.py --markdown` on GitHub's standard
+Ubuntu runners, three times on three machines, and writes each table to the
+summary of the run. Start it from the Actions tab of a fork to repeat it.

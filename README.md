@@ -28,34 +28,43 @@ in one program and compare them. Python 3.10 or later.
 
 ## How much faster
 
-Microseconds per date string, one thread, every string different, on an Apple
-M-series laptop with CPython 3.12.
+Microseconds per date string, one thread, every string different, with CPython
+3.12 on a standard GitHub Actions runner (Ubuntu, Intel Xeon 6975P-C). The table
+is copied from [a run of the Benchmark workflow](https://github.com/shrinish123/flashdate/actions/runs/46038654049)
+of this repository, which anyone can open, or start again in a fork.
 
 | Format, with an example | dateparser | flashdate | Speedup |
 | --- | ---: | ---: | ---: |
-| `2024-03-05` | 376 | 3.1 | 122x |
-| `2024-03-05 13:45:00` | 529 | 3.4 | 156x |
-| `2024-03-05T13:45:00Z` | 810 | 3.5 | 233x |
-| `2024-03-05T13:45:00+05:30` | 745 | 3.4 | 217x |
-| `03/05/2024` | 381 | 3.4 | 113x |
-| `25/03/2024` | 377 | 3.6 | 105x |
-| `3/5/2024 13:45` | 474 | 3.7 | 129x |
-| `March 5, 2024` | 377 | 3.3 | 113x |
-| `Tue, 05 Mar 2024 13:45:00 GMT` | 841 | 3.9 | 213x |
-| `le 5 mars 2024` | 491 | 3.8 | 128x |
-| `5 de marzo de 2024` | 478 | 4.1 | 117x |
-| `5 Март 2024` | 457 | 4.3 | 107x |
-| `3 days ago` | 223 | 21.5 | 10x |
-| Text that is not a date | 4,687 | 249 | 19x |
+| `2024-03-05` | 672 | 4.8 | 141x |
+| `2024-03-05 13:45:00` | 896 | 5.4 | 166x |
+| `2024-03-05T13:45:00Z` | 1,388 | 5.4 | 259x |
+| `2024-03-05T13:45:00+05:30` | 1,338 | 5.5 | 244x |
+| `03/05/2024` | 679 | 5.3 | 129x |
+| `25/03/2024` | 662 | 5.7 | 115x |
+| `3/5/2024 13:45` | 830 | 5.7 | 146x |
+| `March 5, 2024` | 691 | 5.3 | 131x |
+| `Tue, 05 Mar 2024 13:45:00 GMT` | 1,460 | 6.1 | 241x |
+| `le 5 mars 2024` | 935 | 6.0 | 156x |
+| `5 de marzo de 2024` | 877 | 6.2 | 141x |
+| `5 Март 2024` | 841 | 6.3 | 133x |
+| `3 days ago` | 391 | 41.7 | 9x |
+| Text that is not a date | 7,443 | 432 | 17x |
+
+The times depend on the machine, the speedup much less. That run measured three
+runners with three different processors: the first row took flashdate 3.9, 4.8
+and 7.9 microseconds, and was 125, 141 and 133 times faster than dateparser.
+Over the three, the formats above `3 days ago` were 103 to 259 times faster,
+`3 days ago` 8 to 10 times, and text that is not a date 16 to 19 times.
 
 On the 300,000 article publication dates that dateparser keeps for its own
 evaluation, these fast paths read 80% of the dates. Parsing the 248,950 distinct
-strings of that set takes 63 seconds instead of 491 on one core.
+strings of that set takes 63 seconds instead of 491, on one core of an Apple
+M-series laptop.
 
 Date strings in other shapes go through the same steps as in dateparser, which
-are also faster: 100 to 200 microseconds for most of them. Among those are
-two-digit years, hyphenated dates like `5-Mar-2024`, dates with a time or a
-weekday in languages other than English, and free-form phrases.
+are also faster: 2 to 5 times for most of them. Among those are two-digit
+years, hyphenated dates like `5-Mar-2024`, dates with a time or a weekday in
+languages other than English, and free-form phrases.
 
 To measure it on your machine, see [bench/](bench/README.md).
 

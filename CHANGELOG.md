@@ -10,12 +10,12 @@ First release. Built from dateparser at `ce8c4390`: version
 
 - ISO 8601 dates and timestamps, numeric dates with a four-digit year, dates with
   English month names, and dates with month names in French, Spanish, German,
-  Italian, Portuguese and Russian are read without language detection, in about
-  3 microseconds instead of 400 to 800.
-- English relative dates such as "3 days ago" and "in 2 weeks" are read about
+  Italian, Portuguese and Russian are read without language detection, more
+  than 100 times faster: in a few microseconds instead of several hundred.
+- English relative dates such as "3 days ago" and "in 2 weeks" are read 8 to
   10 times faster.
 - Everything else is 2 to 5 times faster, and text that is not a date about
-  19 times: time zones are searched once per string, locales are skipped by the
+  17 times: time zones are searched once per string, locales are skipped by the
   letters and words of the string, and known words are matched with a prefix
   tree.
 - Results are those of dateparser. See `verification/README.md`.

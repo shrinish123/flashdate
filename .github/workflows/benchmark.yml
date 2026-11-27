@@ -2,8 +2,9 @@ name: Benchmark
 # Times flashdate against the unmodified dateparser on GitHub's standard runners
 # and writes the table to the summary of the run. The table in the README is
 # copied from a run of this workflow, so anyone can open the run it came from,
-# or start one in a fork. Runners are shared machines: each system is measured
-# three times, on three machines, to show how much the numbers move.
+# or start one in a fork. Runners are shared machines with different processors:
+# it is measured three times, on three machines, to show how much the numbers
+# move. The macOS runners are left out: their numbers moved too much to say much.
 on:
   workflow_dispatch:
 permissions:
@@ -13,13 +14,12 @@ env:
   UPSTREAM: ce8c4390dad4629daa2f154e7303052f9d88daec
 jobs:
   benchmark:
-    name: ${{ matrix.os }}, run ${{ matrix.run }}
-    runs-on: ${{ matrix.os }}
+    name: Ubuntu, run ${{ matrix.run }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
         run: [1, 2, 3]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -32,13 +32,9 @@ jobs:
             "dateparser @ git+https://github.com/scrapinghub/dateparser@${UPSTREAM}"
       - name: Processor
         run: |
-          if [ "$RUNNER_OS" = Linux ]; then
-            CPU="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs), $(nproc) cores"
-          else
-            CPU="$(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.ncpu) cores"
-          fi
+          CPU="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs), $(nproc) cores"
           echo "$CPU"
-          echo "${{ matrix.os }}, run ${{ matrix.run }}: $CPU" >> "$GITHUB_STEP_SUMMARY"
+          echo "Run ${{ matrix.run }}: $CPU" >> "$GITHUB_STEP_SUMMARY"
           echo >> "$GITHUB_STEP_SUMMARY"
       - name: Measure
         # With this shell the step fails if the script does.
