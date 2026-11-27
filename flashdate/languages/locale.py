@@ -4,7 +4,7 @@ import unicodedata
 from bisect import bisect_right
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from functools import cached_property
-from itertools import chain, islice, product
+from itertools import chain, count, islice, product
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import regex as re
@@ -33,6 +33,7 @@ from .dictionary import (
     KNOWN_WORD_TOKENS,
     Dictionary,
     NormalizedDictionary,
+    _required_letters,
 )
 
 if TYPE_CHECKING:
@@ -77,19 +78,15 @@ def _parse_bool(value: object) -> bool:
     return False
 
 
-def _required_letters(pattern: re.Pattern[str]) -> tuple[frozenset[str], ...]:
-    if pattern.flags & re.VERBOSE:
-        return ()
-    return required_letters(pattern.pattern)
-
-
 def _has_foreign_word(
-    prepared: str, matcher: Any, known: dict[str, bool], unbound: frozenset[str]
+    prepared: str, matcher: Any, native: int, foreign: int, unbound: frozenset[str]
 ) -> bool:
     """Return whether *prepared*, a date string prepared to be simplified, has
-    a word that *matcher* does not match, given what it is *known* to give
-    for some words, and none of the *unbound* letters, with which words may
-    not stay whole."""
+    a word that *matcher* does not match, and none of the *unbound* letters,
+    with which words may not stay whole.
+
+    *native* and *foreign* are the bits that stand, in what is remembered of
+    a word, for *matcher* matching it and not matching it."""
     if unbound and (
         not unbound.isdisjoint(prepared)
         if prepared.isascii()
@@ -97,16 +94,62 @@ def _has_foreign_word(
     ):
         return False
     for word in words(prepared):
-        is_known = known.get(word)
-        if is_known is None:
-            if len(known) >= 4096:
-                known.clear()
-            is_known = known[word] = matcher(word) is not None
-        if not is_known:
-            # Unless a token with a line break is not kept, or lowercasing,
-            # which happens again after each simplification, changes the word.
-            return "\n" not in prepared and prepared == prepared.lower()
+        known = _WORDS.get(word, 0)
+        if not known & foreign:
+            if known & native:
+                continue
+            if matcher(word) is not None:
+                _remember_word(word, native)
+                continue
+            _remember_word(word, foreign)
+        # Unless a token with a line break is not kept, or lowercasing, which
+        # happens again after each simplification, changes the word.
+        return "\n" not in prepared and prepared == prepared.lower()
     return False
+
+
+def _remember_word(word: str, bit: int) -> None:
+    if not bit or len(word) > _MAX_WORD_LENGTH:
+        return
+    known = _WORDS.get(word)
+    if known is None:
+        if len(_WORDS) >= _MAX_WORDS:
+            _WORDS.clear()
+        known = 0
+    _WORDS[word] = known | bit
+
+
+# What the vocabularies of all locales give for the words of the last date
+# strings: a number for each word, with one bit for each vocabulary that
+# matches it and another for each that does not. Most locales do not have a
+# given word, so it is kept once for all of them, not once by each, and this
+# holds the same number of words however many locales are tried.
+_WORDS: dict[str, int] = {}
+_MAX_WORDS = 4096
+# A longer run of letters is no word of a date, and can be of any length.
+_MAX_WORD_LENGTH = 64
+# Each vocabulary takes the next two bits. They are not used again, so that
+# what is remembered stays true, and the vocabularies after this many, which
+# takes changing the settings again and again, go without.
+_MAX_VOCABULARIES = 2048
+_vocabulary_numbers = count()
+_numbers_lock = threading.Lock()
+
+# The simplifications that may apply to the last date strings, by the number
+# given to a collection of simplifications and the letters of a date string.
+# All locales share it, for it to hold the same number of entries however
+# many locales read dates.
+_SIMPLIFICATIONS: dict[tuple[int, frozenset[str]], tuple[int, ...]] = {}
+_MAX_SIMPLIFICATIONS = 2048
+# A date string with more letters than this is a text, and is not kept.
+_MAX_LETTERS = 64
+_simplification_numbers = count()
+
+
+def _next_number(numbers: "count[int]") -> int:
+    # No two locales may be given the same number, in any thread.
+    with _numbers_lock:
+        return next(numbers)
 
 
 def _compile_simplification(pattern: str, no_word_spacing: bool) -> re.Pattern[str]:
@@ -212,7 +255,9 @@ class Locale:
         # The last date string split into tokens: checking that this locale
         # is applicable to a date string and translating it split it the same
         # way, one after the other.
-        self._last_split: tuple[Any, str, bool, list[str]] | None = None
+        self._last_split: (
+            tuple[Any, str, bool, list[str], list[str], bool, Any] | None
+        ) = None
         # What is known about the letters that the patterns of this locale
         # require, by the identity of the collection of patterns.
         self._letter_requirements: dict[int, tuple[Any, Any]] = {}
@@ -222,13 +267,13 @@ class Locale:
         self._bound_dictionary: tuple[Dictionary, Any, list[str], Dictionary] | None
         self._bound_dictionary = None
         self._alphabets: dict[tuple[Any, ...], frozenset[str] | None] = {}
-        # The vocabulary of the settings that it was last worked out for,
-        # with their skip tokens and whether they normalize.
-        self._screen: (
-            tuple[Any, list[str], bool, Any, dict[str, bool], frozenset[str]] | None
-        ) = None
+        # The vocabulary that was last asked for, after the skip tokens and
+        # whether to normalize, which are all that it depends on.
+        self._screen: tuple[list[str], bool, Any, int, int, frozenset[str]] | None = (
+            None
+        )
         self._vocabularies: dict[
-            tuple[Any, ...], tuple[Any, dict[str, bool], frozenset[str]] | None
+            tuple[Any, ...], tuple[Any, int, int, frozenset[str]] | None
         ] = {}
 
     @cached_property
@@ -279,17 +324,18 @@ class Locale:
             screen = self._screen
             if (
                 screen is not None
-                and screen[0] is settings
-                and screen[1] == settings.SKIP_TOKENS
-                and screen[2] == settings.NORMALIZE
+                and screen[0] == settings.SKIP_TOKENS
+                and screen[1] == bool(settings.NORMALIZE)
             ):
                 prepared = date_string
                 if not prepared.isascii():
                     prepared = self._translate_numerals(prepared)
-                    if screen[2]:
+                    if screen[1]:
                         prepared = normalize_unicode(prepared)
                 prepared = self._prepare_to_simplify(prepared)
-                if _has_foreign_word(prepared, screen[3], screen[4], screen[5]):
+                if _has_foreign_word(
+                    prepared, screen[2], screen[3], screen[4], screen[5]
+                ):
                     return False
         dictionary = self._get_dictionary(settings)
         date_tokens = self._split_simplified(
@@ -532,6 +578,10 @@ class Locale:
             and last[1] == date_string
             and last[0] is settings
             and last[2] is keep_formatting
+            # Settings can be changed in place.
+            and last[4] == settings.SKIP_TOKENS
+            and last[5] == bool(settings.NORMALIZE)
+            and last[6] is dictionary
         ):
             return list(last[3])
         prepared = self._translate_numerals(date_string)
@@ -545,7 +595,15 @@ class Locale:
             return None
         simplified = self._simplify_prepared(prepared, settings)
         tokens = dictionary.split(simplified, keep_formatting)
-        self._last_split = (settings, date_string, keep_formatting, tokens.copy())
+        self._last_split = (
+            settings,
+            date_string,
+            keep_formatting,
+            tokens.copy(),
+            list(settings.SKIP_TOKENS),
+            bool(settings.NORMALIZE),
+            dictionary,
+        )
         return tokens
 
     def _has_foreign_word(
@@ -561,13 +619,14 @@ class Locale:
 
     def _get_vocabulary(
         self, settings: "Settings", dictionary: "Dictionary"
-    ) -> tuple[Any, dict[str, bool], frozenset[str]] | None:
+    ) -> tuple[Any, int, int, frozenset[str]] | None:
         """Return a function that matches the words that tokens valid for this
-        locale can have, ignoring case as its patterns do, what it is known to
-        give for some words, and the letters with which this does not hold,
-        or ``None`` if tokens can have any word."""
+        locale can have, ignoring case as its patterns do, the bits for it
+        matching a word and not matching it in what is remembered of words,
+        and the letters with which this does not hold, or ``None`` if tokens
+        can have any word."""
         key = (bool(settings.NORMALIZE), *settings.SKIP_TOKENS)
-        vocabulary: tuple[Any, dict[str, bool], frozenset[str]] | None
+        vocabulary: tuple[Any, int, int, frozenset[str]] | None
         try:
             vocabulary = self._vocabularies[key]
         except KeyError:
@@ -575,6 +634,7 @@ class Locale:
         except TypeError:  # unhashable skip tokens
             return None
         else:
+            self._set_screen(settings, vocabulary)
             return vocabulary
         vocabulary = None
         generated = self._generate_vocabulary(settings, dictionary)
@@ -583,18 +643,28 @@ class Locale:
             pattern = re.compile(
                 _prefix_tree_pattern(sorted(spellings)), re.IGNORECASE | re.UNICODE
             )
-            vocabulary = (pattern.fullmatch, {}, unbound)
+            number = _next_number(_vocabulary_numbers)
+            native = 1 << 2 * number if number < _MAX_VOCABULARIES else 0
+            vocabulary = (pattern.fullmatch, native, native << 1, unbound)
         if len(self._vocabularies) >= 8:
             self._vocabularies.clear()
         self._vocabularies[key] = vocabulary
-        if vocabulary is not None:
-            self._screen = (
-                settings,
-                list(settings.SKIP_TOKENS),
-                bool(settings.NORMALIZE),
-                *vocabulary,
-            )
+        self._set_screen(settings, vocabulary)
         return vocabulary
+
+    def _set_screen(
+        self,
+        settings: "Settings",
+        vocabulary: tuple[Any, int, int, frozenset[str]] | None,
+    ) -> None:
+        screen = self._screen
+        if vocabulary is None or (screen is not None and screen[2] is vocabulary[0]):
+            return
+        self._screen = (
+            list(settings.SKIP_TOKENS),
+            bool(settings.NORMALIZE),
+            *vocabulary,
+        )
 
     def _generate_vocabulary(
         self, settings: "Settings", dictionary: "Dictionary"
@@ -1315,19 +1385,21 @@ class Locale:
                 for simplification in simplifications
             )
             known = self._remember_letter_requirement(
-                simplifications, (requirements, {})
+                simplifications,
+                (requirements, _next_number(_simplification_numbers)),
             )
-        requirements, by_key = known[1]
-        indexes: tuple[int, ...] | None = by_key.get(key)
+        requirements, number = known[1]
+        indexes: tuple[int, ...] | None = _SIMPLIFICATIONS.get((number, key))
         if indexes is None:
             indexes = tuple(
                 index
                 for index, required in enumerate(requirements)
                 if not any(letters.isdisjoint(key) for letters in required)
             )
-            if len(by_key) >= 512:
-                by_key.clear()
-            by_key[key] = indexes
+            if len(key) <= _MAX_LETTERS:
+                if len(_SIMPLIFICATIONS) >= _MAX_SIMPLIFICATIONS:
+                    _SIMPLIFICATIONS.clear()
+                _SIMPLIFICATIONS[number, key] = indexes
         return indexes
 
     def _required_by_any(

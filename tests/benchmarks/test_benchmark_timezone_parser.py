@@ -3,7 +3,11 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
-from flashdate.timezone_parser import _build_tz_regexes, pop_tz_offset_from_string
+from flashdate.timezone_parser import (
+    _build_tz_regexes,
+    _search_tz_remembered,
+    pop_tz_offset_from_string,
+)
 
 if TYPE_CHECKING:
     from pytest_codspeed import BenchmarkFixture
@@ -12,6 +16,8 @@ if TYPE_CHECKING:
 def test_timezone_regexes_first_use(benchmark: BenchmarkFixture) -> None:
     def first_use() -> tuple[str, str | None]:
         _build_tz_regexes.cache_clear()
+        # A remembered search would not need the patterns at all.
+        _search_tz_remembered.cache_clear()
         # re caches compiled patterns, which would otherwise turn every
         # compilation after the first one into a lookup.
         re.purge()

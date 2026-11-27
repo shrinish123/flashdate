@@ -223,15 +223,27 @@ _SIGNED_OFFSET = re.compile(r"(?:\(\?:UTC\|GMT\)|UTC|GMT|\(\?<=\\s\))?\\[+-][0-9
 _WORD_TEMPLATE = r"(\W|\d|_)%s($|\W|(?=\d))"
 
 
-def _prefix_tree_pattern(words: "Iterable[str]") -> str:
-    """Return a pattern that matches the same strings as an alternation of
-    *words*, which must be plain words, without trying every one of them."""
+def _prefix_tree(words: "Iterable[str]") -> dict[str, Any]:
+    """Return the prefix tree of *words*: nested dictionaries by character,
+    with an empty string where a word ends."""
     tree: dict[str, Any] = {}
     for word in words:
         node = tree
         for character in word:
             node = node.setdefault(character, {})
         node[""] = {}
+    return tree
+
+
+def _prefix_tree_pattern(words: "Iterable[str]") -> str:
+    """Return a pattern that matches the same strings as an alternation of
+    *words*, which must be plain words, without trying every one of them."""
+    return _tree_pattern(_prefix_tree(words))
+
+
+def _tree_pattern(tree: dict[str, Any]) -> str:
+    """Return the pattern of :func:`_prefix_tree_pattern` for the words of
+    *tree*, their :func:`_prefix_tree`."""
 
     def pattern(node: dict[str, Any]) -> str:
         branches = [
@@ -348,18 +360,27 @@ def _matched_timezone(match: regex.Match[str], count: int) -> int:
     return int(group[2:])
 
 
-# A date string is searched several times while it is parsed, once per parser
-# that reads timezones.
-@lru_cache(maxsize=256)
-def _find_tz(  # noqa: PLR0912
-    string: str,
-) -> tuple[tuple[int, int], str, timedelta] | None:
+def _find_tz(string: str) -> tuple[tuple[int, int], str, timedelta] | None:
     """Return the span, name and offset of the timezone found in *string*,
     or ``None``.
 
     Earlier pattern templates take precedence over later ones. Within a
     template, the earliest timezone wins, and ties go to the leftmost match.
     """
+    # A date string is searched several times while it is parsed, once per
+    # parser that reads timezones, so the last ones are remembered. A whole
+    # text can be searched as well, and is not: that would keep it alive.
+    if len(string) > _MAX_REMEMBERED_LENGTH:
+        return _search_tz(string)
+    return _search_tz_remembered(string)
+
+
+_MAX_REMEMBERED_LENGTH = 200
+
+
+def _search_tz(  # noqa: PLR0912
+    string: str,
+) -> tuple[tuple[int, int], str, timedelta] | None:
     tz_regexes = _tz_regexes()
     unsigned = "+" not in string and "-" not in string
     for (pattern, timezones), literal, signed in zip(
@@ -405,6 +426,9 @@ def _find_tz(  # noqa: PLR0912
             name, offset = timezones[best[0]]
             return best[1], name, offset
     return None
+
+
+_search_tz_remembered = lru_cache(maxsize=256)(_search_tz)
 
 
 def get_local_tz_offset() -> timedelta:

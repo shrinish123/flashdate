@@ -5,7 +5,7 @@ from unittest import SkipTest
 
 from parameterized import param, parameterized
 
-from flashdate.utils.strptime import strptime
+from flashdate.utils.strptime import _MAX_REMEMBERED_LENGTH, _strptime_cached, strptime
 from tests import BaseTestCase
 
 
@@ -300,3 +300,22 @@ class TestStrptime(BaseTestCase):
     ) -> None:
         self.when_date_string_is_parsed(date_string, fmt)
         self.then_date_object_is(expected)
+
+    def test_only_short_strings_are_remembered(self) -> None:
+        _strptime_cached.cache_clear()
+        padding = "x" * _MAX_REMEMBERED_LENGTH
+        for _ in range(2):
+            self.assertEqual(strptime("2024", "%Y"), datetime(2024, 1, 1))
+            self.assertEqual(
+                strptime("2024" + padding, "%Y" + padding), datetime(2024, 1, 1)
+            )
+            with self.assertRaises(ValueError) as short:
+                strptime("x", "%Y")
+            with self.assertRaises(ValueError) as long:
+                strptime("x" + padding, "%Y")
+            self.assertEqual(
+                str(long.exception),
+                str(short.exception).replace("'x'", repr("x" + padding)),
+            )
+        info = _strptime_cached.cache_info()
+        self.assertEqual((info.hits, info.misses, info.currsize), (2, 2, 2))

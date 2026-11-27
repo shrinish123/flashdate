@@ -50,7 +50,13 @@ def is_letter_free(text: str) -> bool:
     )
 
 
-@lru_cache(maxsize=512)
+# One locale after another asks for the letters and the words of the same
+# date string, which is what remembering them is for. Only the last few are
+# remembered, as a date string can be a whole text.
+_MAX_REMEMBERED_TEXTS = 16
+
+
+@lru_cache(maxsize=_MAX_REMEMBERED_TEXTS)
 def letters(text: str) -> frozenset[str]:
     """Return the letters of *text*."""
     return frozenset(filter(str.isalpha, text))
@@ -304,7 +310,7 @@ _Spellings = frozenset[str]
 _EMPTY: _Spellings = frozenset({""})
 
 
-@lru_cache(maxsize=512)
+@lru_cache(maxsize=_MAX_REMEMBERED_TEXTS)
 def words(text: str) -> frozenset[str]:
     """Return the words of *text*."""
     return frozenset(_WORD.findall(text))

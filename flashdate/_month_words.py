@@ -4,6 +4,9 @@ For each spelling, lowercase, and each phrasing, e.g. ``plain`` for
 "5 janvier 2020" or ``de`` for "5 de marzo de 2019", the locale that reads the
 date and the number of the month, as found by running the parsers on dates of
 that form. See :data:`flashdate.date._FOREIGN`.
+
+The tests read a date of each entry with the parsers and compare, so a change
+to the data of a language that changes one of them does not go unnoticed.
 """
 
 _MONTH_WORDS_DATA = """

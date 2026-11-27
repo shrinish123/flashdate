@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, cast
 
 import regex as re
 
-from flashdate.timezone_parser import _prefix_tree_pattern, is_timezone_token
+from flashdate.timezone_parser import _prefix_tree, _tree_pattern, is_timezone_token
 from flashdate.utils import normalize_unicode
 from flashdate.utils.letters import (
     case_variants,
@@ -49,27 +49,25 @@ def _known_words_pattern(words: list[str]) -> str:
     alternation = "|".join(map(re.escape, words))
     if not all(words):
         return alternation
-    tree: dict[str, Any] = {}
-    for word in words:
-        node = tree
-        for character in word:
-            node = node.setdefault(character, {})
+    tree = _prefix_tree(words)
     pending = [tree]
     while pending:
         node = pending.pop()
         seen: set[str] = set()
         for character, child in node.items():
+            if not character:  # the end of a word
+                continue
             variants = case_variants(character)
             if not seen.isdisjoint(variants) or any(
                 re.fullmatch(re.escape(character), other, _SPLIT_FLAGS)
                 or re.fullmatch(re.escape(other), character, _SPLIT_FLAGS)
                 for other in node
-                if other != character
+                if other and other != character
             ):
                 return alternation
             seen |= variants
             pending.append(child)
-    return _prefix_tree_pattern(words)
+    return _tree_pattern(tree)
 
 
 PARSER_HARDCODED_TOKENS = [":", ".", " ", "-", "/"]

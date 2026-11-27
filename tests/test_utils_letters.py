@@ -1,7 +1,10 @@
+from typing import Any
+
 import pytest
 import regex as re
 
 from flashdate.conf import settings
+from flashdate.languages import locale as locale_module
 from flashdate.languages.loader import default_loader
 from flashdate.utils import normalize_unicode
 from flashdate.utils.letters import (
@@ -15,6 +18,7 @@ from flashdate.utils.letters import (
     requires_letter,
     words,
 )
+from flashdate.utils.letters import letters as letters_of
 
 
 @pytest.mark.parametrize(
@@ -172,6 +176,16 @@ def test_patterns_do_not_match_text_without_their_required_letters(
                 assert not pattern.search(text), (pattern.pattern, text)
 
 
+def test_few_texts_are_remembered() -> None:
+    # A date string can be a whole text, so only the last few are kept.
+    texts = [f"word{'x' * number} 5 2020" for number in range(100)]
+    for remembered in (words, letters_of):
+        remembered.cache_clear()
+        for text in texts:
+            assert remembered(text) == remembered.__wrapped__(text)
+        assert remembered.cache_info().currsize <= 16
+
+
 def test_words() -> None:
     # Digits and underscores tell words apart, like spaces and punctuation.
     assert words("5pm 3rd_of März, 2020 at10") == {"pm", "rd", "of", "März", "at"}
@@ -270,3 +284,150 @@ def test_locale_is_not_applicable_to_text_with_a_foreign_word(language: str) -> 
         assert applicable == dictionary.are_tokens_valid(tokens), (language, text)
         if foreign:
             assert not applicable, (language, text)
+
+
+def test_locale_follows_skip_tokens_that_change_in_place() -> None:
+    locale = default_loader.get_locale("en")
+    text = "5 xx march 2024"
+    changed = settings.replace(SKIP_TOKENS=["t"])
+    assert locale.translate(text, settings=changed) == "5  xx  march 2024"
+    changed.SKIP_TOKENS.append("xx")
+    assert locale.translate(text, settings=changed) == "5 march 2024"
+    assert locale.is_applicable(text, settings=changed)
+    changed.SKIP_TOKENS.remove("xx")
+    assert locale.translate(text, settings=changed) == "5  xx  march 2024"
+    assert not locale.is_applicable(text, settings=changed)
+
+
+def test_words_are_checked_first_for_any_settings_with_the_same_vocabulary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locale = default_loader.get_locale("en")
+    first = settings.replace(TIMEZONE="UTC")
+    second = settings.replace(TIMEZONE="EST")
+    assert first is not second
+    assert not locale.is_applicable("5 janvier 2020", settings=first)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the dictionary should not be needed")
+
+    monkeypatch.setattr(type(locale), "_get_dictionary", fail)
+    assert not locale.is_applicable("5 janvier 2020", settings=second)
+    assert not locale.is_applicable("5 janvier 2020", settings=first)
+
+
+def test_foreign_words_are_remembered_once_for_all_vocabularies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remembered: dict[str, int] = {}
+    monkeypatch.setattr(locale_module, "_WORDS", remembered)
+    calls: list[tuple[str, str]] = []
+
+    def matcher(name: str, *matched: str) -> Any:
+        def match(word: str) -> object:
+            calls.append((name, word))
+            return word if word in matched else None
+
+        return match
+
+    english = (matcher("en", "march", "may"), 1, 2, frozenset[str]())
+    french = (matcher("fr", "mars", "mai"), 4, 8, frozenset[str]())
+    unnumbered = (matcher("no", "march"), 0, 0, frozenset[str]())
+    for _ in range(3):
+        assert not locale_module._has_foreign_word("5 march 2020", *english)
+        assert locale_module._has_foreign_word("5 mars 2020", *english)
+        assert locale_module._has_foreign_word("5 march 2020", *french)
+        assert not locale_module._has_foreign_word("5 mars 2020", *french)
+        assert not locale_module._has_foreign_word("5 march 2020", *unnumbered)
+        assert locale_module._has_foreign_word("5 mars 2020", *unnumbered)
+    # Each vocabulary is asked about a word once, unless it has no bits.
+    assert sorted(calls) == sorted(
+        [("en", "march"), ("en", "mars"), ("fr", "march"), ("fr", "mars")]
+        + [("no", "march"), ("no", "mars")] * 3
+    )
+    assert remembered == {"march": 1 | 8, "mars": 2 | 4}
+
+    monkeypatch.setattr(locale_module, "_MAX_WORDS", 5)
+    for number in range(40):
+        word = "word" + "x" * number
+        assert locale_module._has_foreign_word(f"5 {word} 2020", *english)
+        assert len(remembered) <= 5
+        assert remembered[word] == 2
+
+    # A run of letters of any length is not kept.
+    longest = "y" * locale_module._MAX_WORD_LENGTH
+    for _ in range(2):
+        assert locale_module._has_foreign_word(f"5 {longest} 2020", *english)
+        assert locale_module._has_foreign_word(f"5 {longest}y 2020", *english)
+    assert remembered.get(longest) == 2
+    assert longest + "y" not in remembered
+    assert calls.count(("en", longest)) == 1
+    assert calls.count(("en", longest + "y")) == 2
+
+
+def test_simplifications_are_not_remembered_for_texts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remembered: dict[Any, Any] = {}
+    monkeypatch.setattr(locale_module, "_SIMPLIFICATIONS", remembered)
+    locale = default_loader.get_locale("en")
+    date_string = "5 march 2020"
+    letters = (
+        "".join(map(chr, range(0x0430, 0x0430 + 32))) + "abcdefghijklmnopqrstuvwxyz"
+    )
+    text = f"{letters} abcdefg {date_string}"
+    assert (
+        len(letter_key(date_string))
+        <= locale_module._MAX_LETTERS
+        < len(letter_key(text))
+    )
+    for _ in range(2):
+        simplified = locale._simplify(date_string, settings=settings)
+        assert remembered
+        kept = dict(remembered)
+        assert locale._simplify(text, settings=settings).endswith(simplified)
+        assert remembered == kept
+
+
+@pytest.mark.parametrize("language", ["en", "fr", "de", "es", "ru", "fi"])
+def test_what_is_remembered_does_not_change_what_a_locale_gives(
+    monkeypatch: pytest.MonkeyPatch, language: str
+) -> None:
+    locale = default_loader.get_locale(language)
+    texts = [
+        "5 march 2023",
+        "March 5, 2023 10:30 PM",
+        "3 days ago",
+        "le 5 janvier 2020 à 10h30",
+        "vor 3 tagen",
+        "hace 3 días",
+        "5 ноября 2023 г.",
+        "восемь дней назад",
+        "2 settimane fa",
+        "out of stock",
+        "12:30",
+        "keskiviikko 5. maaliskuuta 2023",
+    ]
+
+    def outcomes() -> list[tuple[bool, str]]:
+        return [
+            (
+                locale.is_applicable(text, settings=settings),
+                locale.translate(text, settings=settings),
+            )
+            for text in texts * 2
+        ]
+
+    expected = outcomes()
+    assert locale_module._WORDS
+    assert locale_module._SIMPLIFICATIONS
+    with monkeypatch.context() as context:
+        # Nothing stays remembered.
+        context.setattr(locale_module, "_MAX_WORDS", 0)
+        context.setattr(locale_module, "_MAX_SIMPLIFICATIONS", 0)
+        locale_module._WORDS.clear()
+        locale_module._SIMPLIFICATIONS.clear()
+        assert outcomes() == expected
+        assert len(locale_module._WORDS) <= 1
+        assert len(locale_module._SIMPLIFICATIONS) <= 1
+    assert outcomes() == expected

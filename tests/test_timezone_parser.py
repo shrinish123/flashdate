@@ -13,9 +13,12 @@ from pytz import timezone
 import flashdate.timezone_parser
 from flashdate import parse
 from flashdate.timezone_parser import (
+    _MAX_REMEMBERED_LENGTH,
     StaticTzInfo,
     _find_tz,
     _prefix_tree_pattern,
+    _search_tz,
+    _search_tz_remembered,
     _tz_regexes,
     build_tz_offsets,
     convert_to_local_tz,
@@ -673,6 +676,21 @@ class TestFindTz(BaseTestCase):
             found += expected is not None
         # Most strings have a timezone, so the comparison is not of misses.
         self.assertGreater(found, len(strings) // 2)
+
+    def test_only_short_strings_are_remembered(self) -> None:
+        _search_tz_remembered.cache_clear()
+        short = "10:00 EST"
+        longest = "x" * (_MAX_REMEMBERED_LENGTH - len(short) - 1) + " " + short
+        longer = "x" + longest
+        for _ in range(3):
+            self.assertEqual(_find_tz(short), _search_tz(short))
+            self.assertEqual(_find_tz(longest), _search_tz(longest))
+            self.assertEqual(_find_tz(longer), _search_tz(longer))
+        self.assertIsNotNone(_find_tz(longer))
+        self.assertEqual(len(longest), _MAX_REMEMBERED_LENGTH)
+        info = _search_tz_remembered.cache_info()
+        self.assertEqual((info.misses, info.currsize), (2, 2))
+        self.assertEqual(info.hits, 4)
 
     @parameterized.expand(
         [

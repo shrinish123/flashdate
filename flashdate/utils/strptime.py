@@ -146,9 +146,13 @@ def strptime(
         date_string, format, reference_year
     )
     locale_time = _locale_time()
-    if locale_time is None or "%Z" in prepared_format:
+    if (
+        locale_time is None
+        or "%Z" in prepared_format
+        or len(date_string) > _MAX_REMEMBERED_LENGTH
+    ):
         # The time zone names that %Z reads may change with the process time
-        # zone.
+        # zone, and a long string is a whole text, not to be kept.
         return _strptime(date_string, prepared_format, day_of_year_in_format)
     result = _strptime_cached(
         date_string, prepared_format, day_of_year_in_format, locale_time
@@ -192,6 +196,9 @@ def reads_am_pm() -> bool:
 
 # Reading a date tries the same few directives on the same few numbers and
 # names over and over, e.g. "05" as a month, as a day and as a year.
+_MAX_REMEMBERED_LENGTH = 100
+
+
 @lru_cache(maxsize=4096)
 def _strptime_cached(
     date_string: str,

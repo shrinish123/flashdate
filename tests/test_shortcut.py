@@ -3,6 +3,7 @@ without going through language detection, translation and the parsers, which
 must give the same outcome."""
 
 import calendar
+import itertools
 import random
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import pytest
 
 import flashdate
 from flashdate import date
+from flashdate._month_words import MONTH_WORDS
 from flashdate.date import DateDataParser
 
 
@@ -458,6 +460,54 @@ def test_shortcut_reads_dates_in_other_languages(
     ):
         date_data = parser.get_date_data(string)
         assert (date_data.date_obj, date_data.locale) == (expected, locale)
+
+
+_PHRASING_FORMS = {
+    "plain": "{day} {word} {year}",
+    "dot": "{day}. {word} {year}",
+    "le": "le {day} {word} {year}",
+    "de": "{day} de {word} de {year}",
+    "g": "{day} {word} {year} г.",
+}
+
+
+def test_shortcut_gives_the_outcome_of_the_parsers_for_every_month_word(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The table of month names says what the parsers give. If the data of a
+    # language changes how they read one of its entries, this fails.
+    calls = []
+    original = DateDataParser._get_date_data
+
+    def record(self: DateDataParser, *args: Any, **kwargs: Any) -> Any:
+        calls.append(args)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(DateDataParser, "_get_date_data", record)
+    assert set(_PHRASING_FORMS) == set(date._PHRASINGS.values())
+    parser = DateDataParser()
+    entries = 0
+    for word, phrasings in MONTH_WORDS.items():
+        for phrasing, (locale, month) in phrasings.items():
+            entries += 1
+            for spelled, (day, year) in itertools.product(
+                (word, word.title(), word.upper()),
+                ((1, 2020), (calendar.monthrange(1000, month)[1], 1000)),
+            ):
+                assert spelled.lower() == word
+                string = _PHRASING_FORMS[phrasing].format(
+                    day=day, word=spelled, year=year
+                )
+                with_shortcut = _outcome(parser, string)
+                assert not calls, string
+                assert with_shortcut[0] == datetime(year, month, day), string
+                assert with_shortcut[5] == locale, string
+                with monkeypatch.context() as context:
+                    context.setattr(date, "_SHORTCUT", False)
+                    assert with_shortcut == _outcome(parser, string), string
+                assert calls, string
+                calls.clear()
+    assert entries == sum(map(len, MONTH_WORDS.values())) > 400
 
 
 def test_shortcut_leaves_other_languages_to_the_languages_given(
