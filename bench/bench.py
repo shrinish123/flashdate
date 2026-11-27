@@ -7,10 +7,15 @@ and the median round is reported, in microseconds per string.
 Usage, in an environment with flashdate, dateparser and python-dateutil::
 
     python bench/bench.py
+
+With ``--markdown`` it prints the table of the README, which is how the
+Benchmark workflow of this repository writes it.
 """
 
 from __future__ import annotations
 
+import argparse
+import platform
 import random
 import statistics
 import time
@@ -22,7 +27,7 @@ from dateutil import parser as dateutil_parser
 import flashdate
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 ROUNDS = 5
 MONTHS = [
@@ -139,10 +144,8 @@ def microseconds(parse: Callable[[str], Any], strings: list[str]) -> float:
     return statistics.median(samples)
 
 
-def main() -> None:
-    print(
-        f"{'date string':32} {'dateparser':>10} {'flashdate':>10} {'speedup':>8} {'dateutil':>9}"
-    )
+def measure() -> Iterator[tuple[str, float, float, float | None]]:
+    """Yield the label and the microseconds of each library, case by case."""
     for label, make, dateutil_reads_it in CASES:
         random_ = random.Random(11)
         # Text that is not a date takes milliseconds in dateparser.
@@ -160,6 +163,33 @@ def main() -> None:
         old, new, other = timings
         assert old is not None
         assert new is not None
+        yield label, old, new, other
+
+
+def rounded(value: float) -> str:
+    return f"{value:.1f}" if value < 100 else f"{value:,.0f}"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Time flashdate against dateparser.")
+    parser.add_argument(
+        "--markdown", action="store_true", help="print the table of the README"
+    )
+    if parser.parse_args().markdown:
+        print(
+            f"{platform.python_implementation()} {platform.python_version()} on "
+            f"{platform.system()} {platform.machine()}, microseconds per date string\n"
+        )
+        print("| Format, with an example | dateparser | flashdate | Speedup |")
+        print("| --- | ---: | ---: | ---: |")
+        for label, old, new, _ in measure():
+            name = label if label == CASES[-1][0] else f"`{label}`"
+            print(f"| {name} | {rounded(old)} | {rounded(new)} | {old / new:.0f}x |")
+        return
+    print(
+        f"{'date string':32} {'dateparser':>10} {'flashdate':>10} {'speedup':>8} {'dateutil':>9}"
+    )
+    for label, old, new, other in measure():
         print(
             f"{label:32} {old:>10.1f} {new:>10.1f} {old / new:>7.1f}x "
             f"{'-' if other is None else format(other, '.1f'):>9}"
